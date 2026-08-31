@@ -1,0 +1,11 @@
+[project]
+name = "comfyui-h3-video-outpaint"
+version = "0.4.0"
+description = "Prompt-free sequential sliding-window MiniMax H3 video outpainting for ComfyUI"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/TwoAbove/ComfyUI-H3VideoOutpaint"
