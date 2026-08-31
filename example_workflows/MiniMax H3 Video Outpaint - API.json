@@ -2,7 +2,7 @@
   "1": {
     "class_type": "LoadVideo",
     "inputs": {
-      "file": "h3_outpaint_example.mp4"
+      "file": "big_buck_bunny_source.mp4"
     }
   },
   "2": {

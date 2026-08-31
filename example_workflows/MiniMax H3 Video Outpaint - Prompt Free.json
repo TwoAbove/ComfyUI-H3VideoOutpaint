@@ -44,10 +44,10 @@
         "Node name for S&R": "LoadVideo"
       },
       "widgets_values": [
-        "h3_outpaint_example.mp4"
+        "big_buck_bunny_source.mp4"
       ],
       "widgets_values_named": {
-        "file": "h3_outpaint_example.mp4"
+        "file": "big_buck_bunny_source.mp4"
       }
     },
     {

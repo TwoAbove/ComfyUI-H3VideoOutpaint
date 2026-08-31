@@ -2,6 +2,10 @@
 
 Prompt-free MiniMax H3 video outpainting for ComfyUI. The node expands a source video to a portrait canvas while preserving temporal continuity across long clips.
 
+![Big Buck Bunny source and outpaint comparison](examples/big_buck_bunny_comparison.gif)
+
+*Original source on the left; 9:12 outpaint on the right.*
+
 ## Requirements
 
 - ComfyUI with native MiniMax H3 support
@@ -57,3 +61,14 @@ H3 requires frame counts of the form `17k+5`. When alignment adds frames beyond 
 
 - `example_workflows/MiniMax H3 Video Outpaint - Prompt Free.json`
 - `example_workflows/MiniMax H3 Video Outpaint - API.json`
+
+Copy `examples/big_buck_bunny_source.mp4` to `ComfyUI/input` before running either workflow.
+
+## Example media
+
+- [`big_buck_bunny_source.mp4`](examples/big_buck_bunny_source.mp4)
+- [`big_buck_bunny_outpaint.mp4`](examples/big_buck_bunny_outpaint.mp4)
+
+The excerpt is from *Big Buck Bunny*, licensed under [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/):
+
+> © 2008 Blender Foundation / [www.bigbuckbunny.org](https://peach.blender.org/)
