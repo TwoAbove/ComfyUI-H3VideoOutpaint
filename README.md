@@ -1,10 +1,10 @@
 # ComfyUI MiniMax H3 Video Outpaint
 
+![Frame-synchronized Big Buck Bunny comparison](examples/big_buck_bunny_comparison.gif)
+
+*Frame-synchronized original and 9:12 outpainted output.*
+
 Prompt-free MiniMax H3 video outpainting for ComfyUI. The node expands a source video to a portrait canvas while preserving temporal continuity across long clips.
-
-![Big Buck Bunny source and outpaint comparison](examples/big_buck_bunny_comparison.gif)
-
-*Original source on the left; 9:12 outpaint on the right.*
 
 ## Requirements
 
