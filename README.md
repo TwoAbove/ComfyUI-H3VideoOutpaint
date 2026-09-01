@@ -1,6 +1,6 @@
 # ComfyUI MiniMax H3 Video Outpaint
 
-![Frame-synchronized Big Buck Bunny comparison](examples/big_buck_bunny_comparison.gif)
+![Frame-synchronized Big Buck Bunny comparison](examples/big_buck_bunny_outpaint_comparison.gif)
 
 *Frame-synchronized original and 9:12 outpainted output.*
 
