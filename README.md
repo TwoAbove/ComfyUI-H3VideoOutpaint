@@ -53,7 +53,7 @@ Recommended starting values are `generation_megapixels=1.0`, `minimum_source_meg
 
 ## Processing
 
-The source is cropped to H3's spatial grid and placed in the target canvas. The target canvas and source clip are encoded once, then sampled chronologically in overlapping, phase-aligned windows. Each completed overlap conditions and anchors the next window. The assembled latent is decoded once and saved at the source frame rate.
+The source is cropped to H3's spatial grid and encoded once. That exact latent is copied into an otherwise empty target latent and also used as the spatially aligned keyframe guide. A binary mask preserves the source footprint and generates only the exterior. Sampling runs chronologically in overlapping, phase-aligned windows; each completed overlap conditions and anchors the next window. The assembled latent is decoded once and saved at the source frame rate.
 
 H3 requires frame counts of the form `17k+5`. When alignment adds frames beyond the source duration, those frames are generated as a continuation.
 

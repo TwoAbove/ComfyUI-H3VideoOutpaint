@@ -29,7 +29,6 @@ CONTEXT_FRAMES = 17
 CONTEXT_LATENT_T = 5
 WINDOW_PIXEL_BUDGET = 90_000_000
 WINDOW_STRIDE_FRAMES = 2 * CONTEXT_FRAMES
-SOURCE_CONTEXT = 128
 DENOISE_WINDOW_FRAMES = (56, 73, 90, 107, 124, 141, 158, 175, 192)
 AUTO_DENOISE_WINDOW_FRAMES = DENOISE_WINDOW_FRAMES[:4]
 
@@ -217,16 +216,6 @@ def _scaled_source_geometry(
     )
 
 
-def _resize_frames(frames, width, height):
-    if frames.shape[1] == height and frames.shape[2] == width:
-        return frames[..., :3]
-    return comfy.utils.common_upscale(
-        frames[..., :3].movedim(-1, 1),
-        width,
-        height,
-        "lanczos",
-        "disabled",
-    ).movedim(1, -1)
 
 
 def _iter_video_frames(video, skip_first_frames, frame_load_cap, crop=None):
@@ -263,20 +252,14 @@ def _iter_video_frames(video, skip_first_frames, frame_load_cap, crop=None):
             yield image
 
 
-def _scan_video_frames(video, skip_first_frames, frame_load_cap, crop=None):
-    first = None
-    last = None
-    count = 0
-    for frame in _iter_video_frames(
-        video, skip_first_frames, frame_load_cap, crop=crop
-    ):
-        if first is None:
-            first = torch.from_numpy(frame).to(torch.float32).div_(255.0)
-        last = torch.from_numpy(frame).to(torch.float32).div_(255.0)
-        count += 1
-    if first is None:
+def _count_video_frames(video, skip_first_frames, frame_load_cap):
+    count = sum(
+        1
+        for _ in _iter_video_frames(video, skip_first_frames, frame_load_cap)
+    )
+    if count == 0:
         raise ValueError("The selected source video contains no frames.")
-    return first.unsqueeze(0), last.unsqueeze(0), count
+    return count
 
 
 def _auto_denoise_window_frames(width, height):
@@ -326,54 +309,27 @@ def _global_window_specs(frame_count, window_frames):
     return specs, window_video_t, window_audio_t
 
 
-def _inpaint_canvas(frames, left, top, right, bottom):
-    height = int(frames.shape[1]) + top + bottom
-    width = int(frames.shape[2]) + left + right
-    canvas = frames.new_full((frames.shape[0], height, width, 3), 0.5)
-    canvas[
-        :,
-        top : top + frames.shape[1],
-        left : left + frames.shape[2],
-    ].copy_(frames[..., :3])
-    return canvas
 
 
 def _spatial_generation_mask(
     latent_h,
     latent_w,
-    canvas_h,
-    canvas_w,
     source_h,
     source_w,
     left,
     top,
-    right,
-    bottom,
     device,
 ):
-    ys = (torch.arange(latent_h, device=device, dtype=torch.float32) + 0.5) * (
-        canvas_h / latent_h
-    )
-    xs = (torch.arange(latent_w, device=device, dtype=torch.float32) + 0.5) * (
-        canvas_w / latent_w
-    )
-    inside_y = (ys >= top) & (ys < top + source_h)
-    inside_x = (xs >= left) & (xs < left + source_w)
-    inside = inside_y[:, None] & inside_x[None, :]
-    mask = (~inside).to(torch.float32)
-
-    def collar(distance):
-        return (distance < SOURCE_CONTEXT).to(torch.float32)
-
-    if top:
-        mask = torch.maximum(mask, collar(ys - top)[:, None] * inside)
-    if bottom:
-        mask = torch.maximum(mask, collar(top + source_h - ys)[:, None] * inside)
-    if left:
-        mask = torch.maximum(mask, collar(xs - left)[None, :] * inside)
-    if right:
-        mask = torch.maximum(mask, collar(left + source_w - xs)[None, :] * inside)
-    return mask[None, None]
+    mask = torch.ones((1, 1, latent_h, latent_w), dtype=torch.float32, device=device)
+    source_y = top // 16
+    source_x = left // 16
+    mask[
+        :,
+        :,
+        source_y : source_y + source_h // 16,
+        source_x : source_x + source_w // 16,
+    ] = 0.0
+    return mask
 
 
 def _observed_video_tokens(frame_count, latent_t):
@@ -453,20 +409,9 @@ def _assemble_global_latent(
     ]
     accumulate_device = comfy.model_management.intermediate_device()
 
-    canvas_frames = _inpaint_canvas(
-        source_frames.to(torch.float32).div_(255.0),
-        left,
-        top,
-        right,
-        bottom,
-    )
-    video = video_vae.encode(canvas_frames)
-    if tuple(video.shape) != video_shape:
-        raise RuntimeError(
-            f"H3 VAE produced {tuple(video.shape)}, expected {video_shape}."
-        )
-    video = video.to(accumulate_device)
-    del canvas_frames
+    source_input = source_frames.to(torch.float32).div_(255.0)
+    source_video = video_vae.encode(source_input)
+    del source_input
 
     observed_video_t = _observed_video_tokens(source_frame_count, global_video_t)
     source_video_shape = (
@@ -476,15 +421,22 @@ def _assemble_global_latent(
         source_frames.shape[1] // 16,
         source_frames.shape[2] // 16,
     )
-    source_input = source_frames.to(torch.float32).div_(255.0)
-    source_video = video_vae.encode(source_input)
     if tuple(source_video.shape) != source_video_shape:
         raise RuntimeError(
             f"H3 source VAE produced {tuple(source_video.shape)}, "
             f"expected {source_video_shape}."
         )
     source_video = source_video.to(accumulate_device)
-    del source_input
+    source_latent_y = top // 16
+    source_latent_x = left // 16
+    video = source_video.new_zeros(video_shape)
+    video[
+        :,
+        :,
+        :,
+        source_latent_y : source_latent_y + source_video.shape[-2],
+        source_latent_x : source_latent_x + source_video.shape[-1],
+    ].copy_(source_video)
 
     audio = torch.zeros(audio_shape, dtype=torch.float32, device=accumulate_device)
     video_mask = (
@@ -632,7 +584,7 @@ class _StreamingH3Video(Input.Video):
         self,
         source_video,
         model,
-        visual_conditioning,
+        conditioning,
         video_vae,
         skip_first_frames,
         frame_load_cap,
@@ -648,7 +600,7 @@ class _StreamingH3Video(Input.Video):
     ):
         self.source_video = source_video
         self.model = model.clone()
-        self.visual_conditioning = visual_conditioning
+        self.conditioning = conditioning
         self.video_vae = video_vae
         self.skip_first_frames = int(skip_first_frames)
         self.frame_load_cap = int(frame_load_cap)
@@ -720,38 +672,15 @@ class _StreamingH3Video(Input.Video):
             self.model_source_width * self.model_source_height / 1_000_000
         )
 
-    def prepare_visual_conditioning(self, clip):
-        first_frame, last_frame, actual_count = _scan_video_frames(
+    def prepare_conditioning(self, clip):
+        actual_count = _count_video_frames(
             self.source_video,
             self.skip_first_frames,
             self.frame_load_cap,
-            crop=(
-                self.crop_left,
-                self.crop_top,
-                self.source_width,
-                self.source_height,
-            ),
         )
         self.source_frame_count = actual_count
         self.frame_count = temporal_shape(actual_count)[0]
-        conditioning_images = [
-            _resize_frames(
-                first_frame,
-                self.model_source_width,
-                self.model_source_height,
-            )
-        ]
-        if actual_count > 1:
-            conditioning_images.append(
-                _resize_frames(
-                    last_frame,
-                    self.model_source_width,
-                    self.model_source_height,
-                )
-            )
-        self.visual_conditioning = clip.encode_from_tokens_scheduled(
-            clip.tokenize("", images=conditioning_images)
-        )
+        self.conditioning = clip.encode_from_tokens_scheduled(clip.tokenize(""))
 
     def get_components(self):
         raise RuntimeError(
@@ -837,14 +766,10 @@ class _StreamingH3Video(Input.Video):
         spatial_mask = _spatial_generation_mask(
             self.model_height // 16,
             self.model_width // 16,
-            self.model_height,
-            self.model_width,
             self.model_source_height,
             self.model_source_width,
             self.model_left,
             self.model_top,
-            self.model_right,
-            self.model_bottom,
             comfy.model_management.intermediate_device(),
         )
         (
@@ -869,8 +794,8 @@ class _StreamingH3Video(Input.Video):
         del source_frames
         sampled = _sample_sliding_latent(
             self.model,
-            self.visual_conditioning,
-            self.visual_conditioning,
+            self.conditioning,
+            self.conditioning,
             latent,
             source_video,
             window_shapes,
@@ -886,7 +811,7 @@ class _StreamingH3Video(Input.Video):
         sampled_video = sampled["samples"].unbind()[0]
         comfy.model_management.unload_all_models()
         self.model = None
-        self.visual_conditioning = None
+        self.conditioning = None
         del sampled, latent, source_video, spatial_mask
         gc.collect()
         comfy.model_management.soft_empty_cache()
@@ -1061,7 +986,7 @@ class MiniMaxH3SimpleVideoOutpaint:
         video = _StreamingH3Video(
             source_video=source_video,
             model=model,
-            visual_conditioning=None,
+            conditioning=None,
             video_vae=video_vae,
             skip_first_frames=skip_first_frames,
             frame_load_cap=frame_load_cap,
@@ -1075,7 +1000,7 @@ class MiniMaxH3SimpleVideoOutpaint:
             scheduler=scheduler,
             temporal_window_frames=temporal_window_frames,
         )
-        video.prepare_visual_conditioning(clip)
+        video.prepare_conditioning(clip)
         denoise_window = (
             "global"
             if video.denoise_window_frames is None
