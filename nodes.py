@@ -9,6 +9,7 @@ from fractions import Fraction
 
 import av
 import torch
+import torchaudio
 
 import comfy.ldm.minimax.model
 import comfy.model_management
@@ -29,6 +30,7 @@ CONTEXT_FRAMES = 17
 CONTEXT_LATENT_T = 5
 WINDOW_PIXEL_BUDGET = 90_000_000
 WINDOW_STRIDE_FRAMES = 2 * CONTEXT_FRAMES
+AUDIO_SAMPLE_RATE = 32000
 DENOISE_WINDOW_FRAMES = (56, 73, 90, 107, 124, 141, 158, 175, 192)
 AUTO_DENOISE_WINDOW_FRAMES = DENOISE_WINDOW_FRAMES[:4]
 
@@ -216,6 +218,99 @@ def _scaled_source_geometry(
     )
 
 
+def _load_source_audio(video, start_time, duration, sample_rate):
+    source = video.get_stream_source()
+    if isinstance(source, io.BytesIO):
+        source.seek(0)
+    sample_count = round(duration * sample_rate)
+    with av.open(source, mode="r") as container:
+        stream = next(
+            (
+                stream
+                for stream in reversed(container.streams.audio)
+                if stream.codec_context is not None
+            ),
+            None,
+        )
+        if stream is None:
+            return None
+
+        waveform = torch.zeros((1, 2, sample_count), dtype=torch.float32)
+        resampler = av.AudioResampler(
+            format="fltp",
+            layout="stereo",
+            rate=sample_rate,
+        )
+        start_pts = int(start_time / stream.time_base)
+        if start_pts:
+            container.seek(start_pts, stream=stream)
+        cursor = 0
+
+        def copy_frame(frame):
+            nonlocal cursor
+            if frame.pts is not None:
+                cursor = round(
+                    (float(frame.pts * frame.time_base) - start_time)
+                    * sample_rate
+                )
+            samples = torch.from_numpy(frame.to_ndarray())
+            source_start = max(0, -cursor)
+            target_start = max(0, cursor)
+            length = min(
+                samples.shape[-1] - source_start,
+                sample_count - target_start,
+            )
+            if length > 0:
+                waveform[
+                    0,
+                    :,
+                    target_start : target_start + length,
+                ].copy_(
+                    samples[
+                        :,
+                        source_start : source_start + length,
+                    ]
+                )
+            cursor += samples.shape[-1]
+
+        for packet in container.demux(stream):
+            for decoded in packet.decode():
+                for frame in resampler.resample(decoded):
+                    copy_frame(frame)
+            if cursor >= sample_count:
+                break
+        for frame in resampler.resample(None):
+            copy_frame(frame)
+        return waveform
+
+
+def _fit_waveform(waveform, sample_count):
+    if waveform.shape[-1] == sample_count:
+        return waveform
+    fitted = waveform.new_zeros((*waveform.shape[:-1], sample_count))
+    copied = min(waveform.shape[-1], sample_count)
+    fitted[..., :copied].copy_(waveform[..., :copied])
+    return fitted
+
+
+def _audio_to_model_timeline(waveform, frame_rate):
+    if frame_rate == FPS:
+        return waveform
+    return torchaudio.functional.resample(
+        waveform,
+        FPS * frame_rate.denominator,
+        frame_rate.numerator,
+    )
+
+
+def _audio_from_model_timeline(waveform, frame_rate):
+    if frame_rate == FPS:
+        return waveform
+    return torchaudio.functional.resample(
+        waveform,
+        frame_rate.numerator,
+        FPS * frame_rate.denominator,
+    )
 
 
 def _iter_video_frames(video, skip_first_frames, frame_load_cap, crop=None):
@@ -391,6 +486,7 @@ def _assemble_global_latent(
     right,
     bottom,
     spatial_mask,
+    source_audio_latent,
     denoise_window_frames,
 ):
     aligned_count = int(source_frames.shape[0])
@@ -439,6 +535,18 @@ def _assemble_global_latent(
     ].copy_(source_latent)
 
     audio = torch.zeros(audio_shape, dtype=torch.float32, device=accumulate_device)
+    observed_audio_t = 0
+    if source_audio_latent is not None:
+        if tuple(source_audio_latent.shape[:-1]) != audio_shape[:-1]:
+            raise RuntimeError(
+                f"H3 audio VAE produced {tuple(source_audio_latent.shape)}, "
+                f"expected [1, 32, 2, T]."
+            )
+        observed_audio_t = min(source_audio_latent.shape[-1], global_audio_t)
+        audio[..., :observed_audio_t].copy_(
+            source_audio_latent[..., :observed_audio_t].to(accumulate_device)
+        )
+
     video_mask = (
         spatial_mask.to(accumulate_device)
         .unsqueeze(2)
@@ -447,8 +555,11 @@ def _assemble_global_latent(
     )
     video_mask[:, :, observed_video_t:] = 1.0
     audio_mask = torch.ones(
-        (1, 1, 2, global_audio_t), dtype=torch.float32, device=accumulate_device
+        (1, 1, 2, global_audio_t),
+        dtype=torch.float32,
+        device=accumulate_device,
     )
+    audio_mask[..., :observed_audio_t] = 0.0
     latent = {
         "samples": comfy.nested_tensor.NestedTensor((video, audio)),
         "noise_mask": comfy.nested_tensor.NestedTensor((video_mask, audio_mask)),
@@ -564,6 +675,7 @@ class _StreamingH3Video(Input.Video):
         model,
         conditioning,
         video_vae,
+        audio_vae,
         skip_first_frames,
         frame_load_cap,
         target_aspect,
@@ -580,6 +692,7 @@ class _StreamingH3Video(Input.Video):
         self.model = model.clone()
         self.conditioning = conditioning
         self.video_vae = video_vae
+        self.audio_vae = audio_vae
         self.skip_first_frames = int(skip_first_frames)
         self.frame_load_cap = int(frame_load_cap)
         self.target_aspect = target_aspect
@@ -650,7 +763,7 @@ class _StreamingH3Video(Input.Video):
             self.model_source_width * self.model_source_height / 1_000_000
         )
 
-    def prepare_conditioning(self, clip):
+    def prepare_conditioning(self, clip, prompt):
         actual_count = _count_video_frames(
             self.source_video,
             self.skip_first_frames,
@@ -658,7 +771,9 @@ class _StreamingH3Video(Input.Video):
         )
         self.source_frame_count = actual_count
         self.frame_count = temporal_shape(actual_count)[0]
-        self.conditioning = clip.encode_from_tokens_scheduled(clip.tokenize(""))
+        self.conditioning = clip.encode_from_tokens_scheduled(
+            clip.tokenize(prompt)
+        )
 
     def get_components(self):
         raise RuntimeError(
@@ -700,6 +815,20 @@ class _StreamingH3Video(Input.Video):
         for packet in stream.encode(video_frame):
             output.mux(packet)
 
+    def _encode_output_audio(self, output, stream, waveform):
+        for start in range(0, waveform.shape[-1], 1024):
+            samples = waveform[0, :, start : start + 1024].numpy()
+            audio_frame = av.AudioFrame.from_ndarray(
+                samples,
+                format="fltp",
+                layout="stereo",
+            )
+            audio_frame.sample_rate = AUDIO_SAMPLE_RATE
+            audio_frame.pts = start
+            audio_frame.time_base = Fraction(1, AUDIO_SAMPLE_RATE)
+            for packet in stream.encode(audio_frame):
+                output.mux(packet)
+
     def save_to(
         self,
         path,
@@ -736,6 +865,27 @@ class _StreamingH3Video(Input.Video):
             ),
         )
         aligned_count = int(source_frames.shape[0])
+        source_audio = _load_source_audio(
+            self.source_video,
+            self.source_video.get_active_trim_window()[0]
+            + self.skip_first_frames / float(self.source_frame_rate),
+            actual_count / float(self.source_frame_rate),
+            AUDIO_SAMPLE_RATE,
+        )
+        source_audio_latent = None
+        if source_audio is not None:
+            model_audio = _audio_to_model_timeline(
+                source_audio,
+                self.source_frame_rate,
+            )
+            model_audio = _fit_waveform(
+                model_audio,
+                round(actual_count / FPS * AUDIO_SAMPLE_RATE),
+            )
+            source_audio_latent = self.audio_vae.encode(
+                model_audio.movedim(1, -1)
+            )
+            del model_audio
         window_frames = (
             aligned_count
             if self.denoise_window_frames is None
@@ -759,6 +909,7 @@ class _StreamingH3Video(Input.Video):
             self.model_right,
             self.model_bottom,
             spatial_mask,
+            source_audio_latent,
             window_frames,
         )
         del source_frames
@@ -774,11 +925,11 @@ class _StreamingH3Video(Input.Video):
             self.sampler_name,
             self.scheduler,
         )
-        sampled_video = sampled["samples"].unbind()[0]
+        sampled_video, sampled_audio = sampled["samples"].unbind()
         comfy.model_management.unload_all_models()
         self.model = None
         self.conditioning = None
-        del sampled, latent, spatial_mask
+        del sampled, latent, spatial_mask, source_audio_latent
         gc.collect()
         comfy.model_management.soft_empty_cache()
 
@@ -796,6 +947,67 @@ class _StreamingH3Video(Input.Video):
             )
         decoded_frames = decoded_frames.to(device="cpu", dtype=torch.float32)
         del sampled_video
+        output_audio = None
+        if source_audio is not None:
+            output_sample_count = round(
+                aligned_count
+                / float(self.source_frame_rate)
+                * AUDIO_SAMPLE_RATE
+            )
+            if aligned_count == actual_count:
+                output_audio = _fit_waveform(
+                    source_audio,
+                    output_sample_count,
+                )
+            else:
+                output_audio = self.audio_vae.decode(sampled_audio)
+                output_audio = output_audio.movedim(-1, 1).to(
+                    device="cpu",
+                    dtype=torch.float32,
+                )
+                output_audio = _audio_from_model_timeline(
+                    output_audio,
+                    self.source_frame_rate,
+                )
+                output_audio = _fit_waveform(
+                    output_audio,
+                    output_sample_count,
+                )
+                source_samples = source_audio.shape[-1]
+                transition_samples = min(
+                    source_samples,
+                    round(
+                        800
+                        * FPS
+                        / float(self.source_frame_rate)
+                    ),
+                )
+                transition_start = source_samples - transition_samples
+                output_audio[..., :transition_start].copy_(
+                    source_audio[..., :transition_start]
+                )
+                weight = torch.linspace(
+                    0.0,
+                    1.0,
+                    transition_samples,
+                    dtype=output_audio.dtype,
+                )
+                output_audio[
+                    ...,
+                    transition_start:source_samples,
+                ] = torch.lerp(
+                    source_audio[
+                        ...,
+                        transition_start:source_samples,
+                    ],
+                    output_audio[
+                        ...,
+                        transition_start:source_samples,
+                    ],
+                    weight,
+                )
+        self.audio_vae = None
+        del sampled_audio, source_audio
 
         open_options = {
             "mode": "w",
@@ -817,19 +1029,29 @@ class _StreamingH3Video(Input.Video):
                     output.metadata[key] = (
                         value if isinstance(value, str) else json.dumps(value)
                     )
-            output_stream = output.add_stream("h264", rate=self.frame_rate)
-            output_stream.width = self.width
-            output_stream.height = self.height
-            output_stream.pix_fmt = "yuv420p"
+            video_stream = output.add_stream("h264", rate=self.frame_rate)
+            video_stream.width = self.width
+            video_stream.height = self.height
+            video_stream.pix_fmt = "yuv420p"
             if crf is not None:
-                output_stream.options = {"crf": str(crf)}
+                video_stream.options = {"crf": str(crf)}
+
+            audio_stream = None
+            if output_audio is not None:
+                audio_stream = output.add_stream("aac", rate=AUDIO_SAMPLE_RATE)
+                audio_stream.layout = "stereo"
+                audio_stream.bit_rate = 192000
 
             for generated_frame in decoded_frames:
-                self._encode_output_frame(output, output_stream, generated_frame)
+                self._encode_output_frame(output, video_stream, generated_frame)
                 encoded_count += 1
 
-            for packet in output_stream.encode(None):
+            for packet in video_stream.encode(None):
                 output.mux(packet)
+            if audio_stream is not None:
+                self._encode_output_audio(output, audio_stream, output_audio)
+                for packet in audio_stream.encode(None):
+                    output.mux(packet)
 
         if encoded_count != aligned_count:
             raise RuntimeError(
@@ -846,6 +1068,12 @@ class MiniMaxH3SimpleVideoOutpaint:
                 "model": ("MODEL",),
                 "clip": ("CLIP",),
                 "video_vae": ("VAE",),
+                "audio_vae": (
+                    "VAE",
+                    {
+                        "tooltip": "MiniMax H3 audio VAE. Conditions on source audio and generates any aligned tail."
+                    },
+                ),
                 "source_video": ("VIDEO",),
                 "skip_first_frames": (
                     "INT",
@@ -915,6 +1143,14 @@ class MiniMaxH3SimpleVideoOutpaint:
                 ),
             },
             "optional": {
+                "prompt": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "dynamicPrompts": True,
+                    },
+                ),
                 "temporal_window_frames": (
                     ["auto", "107", "124", "158", "192", "global"],
                     {
@@ -929,13 +1165,14 @@ class MiniMaxH3SimpleVideoOutpaint:
     RETURN_NAMES = ("video", "width", "height", "fps", "length", "info")
     FUNCTION = "outpaint"
     CATEGORY = "MiniMax H3/Outpaint"
-    DESCRIPTION = "Prompt-free H3 outpainting with phase-stable temporal continuation."
+    DESCRIPTION = "H3 video outpainting with optional text guidance and phase-stable temporal continuation."
 
     def outpaint(
         self,
         model,
         clip,
         video_vae,
+        audio_vae,
         source_video,
         skip_first_frames,
         frame_load_cap,
@@ -947,6 +1184,7 @@ class MiniMaxH3SimpleVideoOutpaint:
         steps,
         sampler_name,
         scheduler,
+        prompt="",
         temporal_window_frames="auto",
     ):
         video = _StreamingH3Video(
@@ -954,6 +1192,7 @@ class MiniMaxH3SimpleVideoOutpaint:
             model=model,
             conditioning=None,
             video_vae=video_vae,
+            audio_vae=audio_vae,
             skip_first_frames=skip_first_frames,
             frame_load_cap=frame_load_cap,
             target_aspect=target_aspect,
@@ -966,7 +1205,7 @@ class MiniMaxH3SimpleVideoOutpaint:
             scheduler=scheduler,
             temporal_window_frames=temporal_window_frames,
         )
-        video.prepare_conditioning(clip)
+        video.prepare_conditioning(clip, prompt)
         denoise_window = (
             "global"
             if video.denoise_window_frames is None
@@ -1001,5 +1240,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "MiniMaxH3SimpleVideoOutpaint": "MiniMax H3 Video Outpaint (Prompt Free)",
+    "MiniMaxH3SimpleVideoOutpaint": "MiniMax H3 Video Outpaint",
 }

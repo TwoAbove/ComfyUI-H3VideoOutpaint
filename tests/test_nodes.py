@@ -1,4 +1,5 @@
 import importlib.util
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -61,6 +62,22 @@ class FakeVAE:
             (frame_count, latent.shape[-2] * 16, latent.shape[-1] * 16, 3),
             0.25,
         )
+
+class FakeAudioVAE:
+    def __init__(self):
+        self.encoded = []
+        self.decoded = []
+
+    def encode(self, waveform):
+        self.encoded.append(waveform.clone())
+        latent_t = math.ceil(waveform.shape[1] / 800)
+        return torch.full((1, 32, 2, latent_t), 0.5)
+
+    def decode(self, latent):
+        self.decoded.append(latent.clone())
+        waveform = latent.mean(dim=1).repeat_interleave(800, dim=-1)
+        return waveform.movedim(1, -1)
+
 
 
 class FakeLazyVideo(h3_nodes.Input.Video):
@@ -267,6 +284,7 @@ class MaskOwnershipTests(unittest.TestCase):
             0,
             16,
             spatial_mask,
+            None,
             73,
         )
         video_mask = latent["noise_mask"].unbind()[0]
@@ -301,6 +319,42 @@ class MaskOwnershipTests(unittest.TestCase):
 
 
 
+    def test_global_latent_preserves_source_audio_and_generates_tail(self):
+        source_count = 18
+        aligned_count, _, global_audio_t = h3_nodes.temporal_shape(source_count)
+        source = torch.zeros((aligned_count, 32, 64, 3), dtype=torch.uint8)
+        spatial_mask = h3_nodes._spatial_generation_mask(
+            6,
+            4,
+            32,
+            64,
+            0,
+            32,
+            torch.device("cpu"),
+        )
+        source_audio = torch.full((1, 32, 2, 30), 0.5)
+
+        latent, _, _ = h3_nodes._assemble_global_latent(
+            source,
+            source_count,
+            FakeVAE(),
+            0,
+            32,
+            0,
+            32,
+            spatial_mask,
+            source_audio,
+            aligned_count,
+        )
+        audio = latent["samples"].unbind()[1]
+        audio_mask = latent["noise_mask"].unbind()[1]
+
+        self.assertEqual(audio.shape[-1], global_audio_t)
+        self.assertTrue(torch.all(audio[..., :30] == 0.5))
+        self.assertTrue(torch.all(audio[..., 30:] == 0))
+        self.assertTrue(torch.all(audio_mask[..., :30] == 0))
+        self.assertTrue(torch.all(audio_mask[..., 30:] == 1))
+
 class GeometryTests(unittest.TestCase):
     def test_auto_caps_at_validated_window_without_rewriting_manual_values(self):
         self.assertEqual(h3_nodes._auto_denoise_window_frames(64, 64), 107)
@@ -316,6 +370,7 @@ class GeometryTests(unittest.TestCase):
                 model=FakeModel(),
                 conditioning=None,
                 video_vae=FakeVAE(),
+                audio_vae=None,
                 skip_first_frames=0,
                 frame_load_cap=192,
                 target_aspect="9:12 portrait",
@@ -392,12 +447,14 @@ class StreamingContractTests(unittest.TestCase):
                 frame_rate=30,
             )
             vae = FakeVAE()
+            audio_vae = FakeAudioVAE()
             clip = FakeClip()
             video, width, height, fps, length, info = (
                 h3_nodes.MiniMaxH3SimpleVideoOutpaint().outpaint(
                     model=FakeModel(),
                     clip=clip,
                     video_vae=vae,
+                    audio_vae=audio_vae,
                     source_video=source_video,
                     skip_first_frames=0,
                     frame_load_cap=0,
@@ -409,6 +466,7 @@ class StreamingContractTests(unittest.TestCase):
                     steps=1,
                     sampler_name="res_multistep",
                     scheduler="simple",
+                    prompt="lush meadow",
                 )
             )
             original_encode = video._encode_output_frame
@@ -442,14 +500,18 @@ class StreamingContractTests(unittest.TestCase):
                 decoded_count = sum(1 for _ in container.decode(output_stream))
                 output_fps = float(output_stream.average_rate)
                 output_size = (output_stream.width, output_stream.height)
+                audio_stream_count = len(container.streams.audio)
 
         self.assertFalse(source_video.components_requested)
-        self.assertEqual(clip.prompts, [""])
+        self.assertEqual(clip.prompts, ["lush meadow"])
         self.assertEqual(clip.image_batches, [None])
         self.assertEqual((width, height, fps, length), (64, 96, 30.0, aligned_count))
         self.assertEqual(output_size, (64, 96))
         self.assertEqual(output_fps, 30.0)
         self.assertEqual(decoded_count, aligned_count)
+        self.assertEqual(audio_stream_count, 0)
+        self.assertEqual(audio_vae.encoded, [])
+        self.assertEqual(audio_vae.decoded, [])
         self.assertEqual(len(vae.encoded), 1)
         self.assertEqual(vae.encoded[0].shape, (aligned_count, 32, 64, 3))
         target_latent = sampler_latents[0]
@@ -497,6 +559,141 @@ class StreamingContractTests(unittest.TestCase):
         self.assertIn("internal 24 fps, delivered at 30 fps", info)
         self.assertNotIn("MiniMaxH3VideoOutpaintToSize", h3_nodes.NODE_CLASS_MAPPINGS)
 
+
+    def test_save_conditions_on_source_audio_and_muxes_generated_tail(self):
+        source_count = 18
+        frame_rate = 30
+        aligned_count = h3_nodes.temporal_shape(source_count)[0]
+        audio_masks = []
+
+        def sample_sliding(*args, **kwargs):
+            latent = args[3]
+            audio_masks.append(latent["noise_mask"].unbind()[1].clone())
+            return {"samples": latent["samples"]}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "source_audio.mp4"
+            output_path = Path(temp_dir) / "output_audio.mp4"
+            with h3_nodes.av.open(source_path, mode="w") as container:
+                video_stream = container.add_stream("h264", rate=frame_rate)
+                video_stream.width = 64
+                video_stream.height = 32
+                video_stream.pix_fmt = "yuv420p"
+                audio_stream = container.add_stream(
+                    "aac",
+                    rate=h3_nodes.AUDIO_SAMPLE_RATE,
+                )
+                audio_stream.layout = "stereo"
+                for index in range(source_count):
+                    image = torch.full(
+                        (32, 64, 3),
+                        index,
+                        dtype=torch.uint8,
+                    )
+                    frame = h3_nodes.av.VideoFrame.from_ndarray(
+                        image.numpy(),
+                        format="rgb24",
+                    )
+                    for packet in video_stream.encode(frame):
+                        container.mux(packet)
+                for packet in video_stream.encode(None):
+                    container.mux(packet)
+
+                sample_count = round(
+                    source_count
+                    / frame_rate
+                    * h3_nodes.AUDIO_SAMPLE_RATE
+                )
+                time = torch.arange(sample_count) / h3_nodes.AUDIO_SAMPLE_RATE
+                waveform = (
+                    0.1
+                    * torch.sin(2 * math.pi * 440 * time)
+                    .repeat(2, 1)
+                    .to(torch.float32)
+                )
+                for start in range(0, sample_count, 1024):
+                    frame = h3_nodes.av.AudioFrame.from_ndarray(
+                        waveform[:, start : start + 1024].numpy(),
+                        format="fltp",
+                        layout="stereo",
+                    )
+                    frame.sample_rate = h3_nodes.AUDIO_SAMPLE_RATE
+                    frame.pts = start
+                    frame.time_base = h3_nodes.Fraction(
+                        1,
+                        h3_nodes.AUDIO_SAMPLE_RATE,
+                    )
+                    for packet in audio_stream.encode(frame):
+                        container.mux(packet)
+                for packet in audio_stream.encode(None):
+                    container.mux(packet)
+
+            source_video = FakeLazyVideo(
+                source_path,
+                width=64,
+                height=32,
+                frame_count=source_count,
+                frame_rate=frame_rate,
+            )
+            video_vae = FakeVAE()
+            audio_vae = FakeAudioVAE()
+            video = h3_nodes.MiniMaxH3SimpleVideoOutpaint().outpaint(
+                model=FakeModel(),
+                clip=FakeClip(),
+                video_vae=video_vae,
+                audio_vae=audio_vae,
+                source_video=source_video,
+                skip_first_frames=0,
+                frame_load_cap=0,
+                target_aspect="9:12 portrait",
+                generation_megapixels=0,
+                minimum_source_megapixels=0,
+                max_upscale=1.5,
+                seed=7,
+                steps=1,
+                sampler_name="res_multistep",
+                scheduler="simple",
+            )[0]
+
+            with patch.object(
+                h3_nodes,
+                "_sample_sliding_latent",
+                side_effect=sample_sliding,
+            ):
+                video.save_to(output_path)
+
+            with h3_nodes.av.open(output_path, mode="r") as container:
+                self.assertEqual(len(container.streams.audio), 1)
+                audio_stream = container.streams.audio[0]
+                output_audio = torch.cat(
+                    [
+                        torch.from_numpy(frame.to_ndarray())
+                        for frame in container.decode(audio_stream)
+                    ],
+                    dim=-1,
+                )
+                audio_duration = float(
+                    audio_stream.duration * audio_stream.time_base
+                )
+
+        expected_model_samples = round(
+            source_count / h3_nodes.FPS * h3_nodes.AUDIO_SAMPLE_RATE
+        )
+        self.assertFalse(source_video.components_requested)
+        self.assertEqual(
+            audio_vae.encoded[0].shape,
+            (1, expected_model_samples, 2),
+        )
+        self.assertEqual(len(audio_vae.decoded), 1)
+        self.assertEqual(len(audio_masks), 1)
+        self.assertTrue(torch.all(audio_masks[0][..., :30] == 0))
+        self.assertTrue(torch.all(audio_masks[0][..., 30:] == 1))
+        self.assertGreater(output_audio.abs().max().item(), 0.01)
+        self.assertAlmostEqual(
+            audio_duration,
+            aligned_count / frame_rate,
+            delta=0.05,
+        )
 
 if __name__ == "__main__":
     unittest.main()

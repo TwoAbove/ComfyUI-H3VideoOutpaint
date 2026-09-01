@@ -51,10 +51,15 @@
         "2",
         0
       ],
+      "audio_vae": [
+        "7",
+        0
+      ],
       "seed": 20260808,
       "steps": 20,
       "sampler_name": "res_multistep",
       "scheduler": "simple",
+      "prompt": "",
       "target_aspect": "9:12 portrait",
       "generation_megapixels": 1.0,
       "source_video": [
@@ -68,6 +73,12 @@
       "temporal_window_frames": "auto"
     }
   },
+  "7": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    }
+  },
   "8": {
     "class_type": "SaveVideo",
     "inputs": {
@@ -75,7 +86,7 @@
         "6",
         0
       ],
-      "filename_prefix": "MiniMax_H3_Outpaint_Simple_PromptFree",
+      "filename_prefix": "MiniMax_H3_Outpaint",
       "format": "auto",
       "codec": "auto"
     }

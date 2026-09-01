@@ -4,7 +4,7 @@
 
 *Frame-synchronized original and 9:12 outpainted output.*
 
-Prompt-free MiniMax H3 video outpainting for ComfyUI. The node expands a source video to a portrait canvas while preserving temporal continuity across long clips.
+MiniMax H3 video outpainting for ComfyUI. The node expands a source video to a portrait canvas while preserving temporal continuity across long clips.
 
 ## Requirements
 
@@ -12,6 +12,7 @@ Prompt-free MiniMax H3 video outpainting for ComfyUI. The node expands a source 
 - MiniMax H3 FL2VA model
 - MiniMax-compatible Qwen3-VL text encoder
 - MiniMax H3 video VAE
+- MiniMax H3 audio VAE
 
 ## Installation
 
@@ -27,11 +28,12 @@ Restart ComfyUI after cloning. No additional Python packages are required.
 ```text
 Load Video ───────────────┐
 Load H3 MODEL ─┐          │
-Load H3 CLIP ──┼─> MiniMax H3 Video Outpaint (Prompt Free) ─> Save Video
-Load H3 VAE ───┘
+Load H3 CLIP ──┤          │
+Load H3 VIDEO VAE ────────┼─> MiniMax H3 Video Outpaint ─> Save Video
+Load H3 AUDIO VAE ────────┘
 ```
 
-The node does not accept a prompt. Connect the H3 model, text encoder, video VAE, and source `VIDEO`, then route the output directly to `Save Video`.
+The prompt is optional. Source audio is preserved, used as H3 context, and continued when frame alignment extends the video. Silent sources remain silent.
 
 For lower VRAM use, route the model through:
 
@@ -59,7 +61,7 @@ H3 requires frame counts of the form `17k+5`. When alignment adds frames beyond 
 
 ## Example workflows
 
-- `example_workflows/MiniMax H3 Video Outpaint - Prompt Free.json`
+- `example_workflows/MiniMax H3 Video Outpaint.json`
 - `example_workflows/MiniMax H3 Video Outpaint - API.json`
 
 Copy `examples/big_buck_bunny_source.mp4` to `ComfyUI/input` before running either workflow.
