@@ -139,7 +139,6 @@ class WindowingTests(unittest.TestCase):
                 (video_mask, audio_mask)
             ),
         }
-        source_video = torch.full((1, 1, global_video_t, 1, 1), 2.0)
         conditioning = [[torch.zeros((1, 1, 1)), {}]]
         calls = []
 
@@ -163,15 +162,11 @@ class WindowingTests(unittest.TestCase):
                 conditioning,
                 conditioning,
                 latent,
-                source_video,
                 [
                     (1, 1, window_video_t, 1, 1),
                     (1, 1, 2, window_audio_t),
                 ],
                 specs,
-                global_video_t,
-                0,
-                0,
                 7,
                 1,
                 "res_multistep",
@@ -184,12 +179,12 @@ class WindowingTests(unittest.TestCase):
         self.assertTrue(torch.all(second_video_mask[:, :, 12:] == 1))
         self.assertTrue(torch.all(second_audio_mask[..., :66] == 0))
         self.assertTrue(torch.all(second_audio_mask[..., 66:] == 1))
-        overlap_keyframe, source_keyframe = calls[1]["keyframes"]
+        self.assertEqual(calls[0]["keyframes"], [])
+        (overlap_keyframe,) = calls[1]["keyframes"]
         self.assertEqual(overlap_keyframe["latent"].shape[2], 12)
         self.assertTrue(torch.all(overlap_keyframe["latent"] == 10))
         self.assertEqual(overlap_keyframe["audio_latent"].shape[3], 66)
         self.assertTrue(torch.all(overlap_keyframe["audio_latent"] == 10))
-        self.assertEqual(source_keyframe["latent"].shape[2], window_video_t)
 
         sampled_video, sampled_audio = sampled["samples"].unbind()
         self.assertTrue(torch.all(sampled_video[:, :, :window_video_t] == 10))
@@ -220,13 +215,10 @@ class MaskOwnershipTests(unittest.TestCase):
         self.assertEqual(h3_nodes._observed_video_tokens(621, 187), 183)
 
     def test_keyframes_use_native_conditioning_metadata(self):
-        source_video = torch.randn((1, 24, 5, 2, 4))
         existing = {"resolved_frame_index": 9, "latent": torch.zeros(1)}
         keyframe = {
             "resolved_frame_index": 0,
-            "latent": source_video,
-            "latent_y": 8,
-            "latent_x": 2,
+            "latent": torch.randn((1, 24, 5, 2, 4)),
         }
         conditioning = [
             [torch.zeros((1, 1, 1)), {"minimax_keyframes": [existing]}]
@@ -244,45 +236,8 @@ class MaskOwnershipTests(unittest.TestCase):
             conditioned[0][1]["minimax_keyframes"][1],
             keyframe,
         )
-        self.assertIs(
-            conditioned[0][1]["minimax_keyframes"][1]["latent"],
-            source_video,
-        )
         self.assertIsNot(conditioned[0][1], conditioning[0][1])
 
-    def test_spatial_keyframe_rows_share_target_coordinates(self):
-        layout = h3_nodes.comfy.ldm.minimax.model.PackedLayout(
-            text_len=1,
-            latent_t=2,
-            latent_h=6,
-            latent_w=8,
-            audio_t=1,
-            keyframes=[
-                {
-                    "resolved_frame_index": 0,
-                    "latent": torch.zeros((1, 24, 2, 2, 4)),
-                    "latent_y": 2,
-                    "latent_x": 2,
-                }
-            ],
-        )
-        cond_start, cond_stop, _ = next(
-            segment for segment in layout.segments if segment[2] == "cond"
-        )
-        video_start, _, _ = next(
-            segment for segment in layout.segments if segment[2] == "video"
-        )
-        target_rows = torch.tensor([5, 6, 17, 18]) + video_start
-
-        self.assertTrue(
-            torch.equal(
-                layout.position_ids[cond_start:cond_stop],
-                layout.position_ids[target_rows],
-            )
-        )
-        self.assertTrue(
-            torch.all(~layout.img_update[: cond_stop - cond_start])
-        )
 
     def test_global_latent_copies_one_source_encoding_into_target(self):
         source_count = 103
@@ -303,15 +258,7 @@ class MaskOwnershipTests(unittest.TestCase):
             torch.device("cpu"),
         )
 
-        (
-            latent,
-            source_video,
-            window_shapes,
-            specs,
-            observed,
-            source_latent_y,
-            source_latent_x,
-        ) = h3_nodes._assemble_global_latent(
+        latent, window_shapes, specs = h3_nodes._assemble_global_latent(
             source,
             source_count,
             vae,
@@ -324,6 +271,9 @@ class MaskOwnershipTests(unittest.TestCase):
         )
         video_mask = latent["noise_mask"].unbind()[0]
         video = latent["samples"].unbind()[0]
+        observed = h3_nodes._observed_video_tokens(
+            source_count, video_mask.shape[2]
+        )
 
         self.assertEqual(len(vae.encoded), 1)
         self.assertEqual(
@@ -331,7 +281,7 @@ class MaskOwnershipTests(unittest.TestCase):
             (aligned_count, 288, 32, 3),
         )
         self.assertTrue(torch.all(video[:, :, :, :1] == 0))
-        self.assertTrue(torch.equal(video[:, :, :, 1:19], source_video))
+        self.assertTrue(torch.all(video[:, :, :, 1:19] == 1))
         self.assertTrue(torch.all(video[:, :, :, 19:] == 0))
         self.assertTrue(
             torch.all(video_mask[:, :, :observed, 1:19] == 0)
@@ -348,9 +298,6 @@ class MaskOwnershipTests(unittest.TestCase):
             h3_nodes.temporal_shape(73)[1],
         )
         self.assertEqual(specs, [(0, 0, 0), (34, 10, 56)])
-        self.assertEqual((source_latent_y, source_latent_x), (1, 0))
-        self.assertEqual(source_video.shape, (1, 24, 32, 18, 2))
-        self.assertLess(observed, source_video.shape[2])
 
 
 
@@ -411,11 +358,7 @@ class StreamingContractTests(unittest.TestCase):
         def sample_sliding(*args, **kwargs):
             latent = args[3]
             sampler_masks.append(latent["noise_mask"].unbind()[0].clone())
-            video_latent = latent["samples"].unbind()[0]
-            source_latent = args[4]
-            sampler_latents.append(
-                (video_latent.clone(), source_latent.clone(), args[8], args[9])
-            )
+            sampler_latents.append(latent["samples"].unbind()[0].clone())
             return {"samples": latent["samples"]}
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -509,17 +452,21 @@ class StreamingContractTests(unittest.TestCase):
         self.assertEqual(decoded_count, aligned_count)
         self.assertEqual(len(vae.encoded), 1)
         self.assertEqual(vae.encoded[0].shape, (aligned_count, 32, 64, 3))
-        target_latent, source_latent, source_y, source_x = sampler_latents[0]
+        target_latent = sampler_latents[0]
+        source_y = video.model_top // 16
+        source_x = video.model_left // 16
+        source_h = vae.encoded[0].shape[1] // 16
+        source_w = vae.encoded[0].shape[2] // 16
         self.assertTrue(
-            torch.equal(
+            torch.all(
                 target_latent[
                     :,
                     :,
                     :,
-                    source_y : source_y + source_latent.shape[-2],
-                    source_x : source_x + source_latent.shape[-1],
-                ],
-                source_latent,
+                    source_y : source_y + source_h,
+                    source_x : source_x + source_w,
+                ]
+                == 1
             )
         )
         self.assertEqual(len(vae.decoded), 1)
@@ -538,8 +485,8 @@ class StreamingContractTests(unittest.TestCase):
             :,
             :,
             :,
-            source_y : source_y + source_latent.shape[-2],
-            source_x : source_x + source_latent.shape[-1],
+            source_y : source_y + source_h,
+            source_x : source_x + source_w,
         ] = 0.0
         self.assertTrue(torch.equal(mask[:, :, :observed], expected_mask))
         self.assertTrue(torch.all(mask[:, :, observed:] == 1))

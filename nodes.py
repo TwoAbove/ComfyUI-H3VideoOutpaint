@@ -410,33 +410,33 @@ def _assemble_global_latent(
     accumulate_device = comfy.model_management.intermediate_device()
 
     source_input = source_frames.to(torch.float32).div_(255.0)
-    source_video = video_vae.encode(source_input)
+    source_latent = video_vae.encode(source_input)
     del source_input
 
     observed_video_t = _observed_video_tokens(source_frame_count, global_video_t)
-    source_video_shape = (
+    source_shape = (
         1,
         24,
         global_video_t,
         source_frames.shape[1] // 16,
         source_frames.shape[2] // 16,
     )
-    if tuple(source_video.shape) != source_video_shape:
+    if tuple(source_latent.shape) != source_shape:
         raise RuntimeError(
-            f"H3 source VAE produced {tuple(source_video.shape)}, "
-            f"expected {source_video_shape}."
+            f"H3 source VAE produced {tuple(source_latent.shape)}, "
+            f"expected {source_shape}."
         )
-    source_video = source_video.to(accumulate_device)
-    source_latent_y = top // 16
-    source_latent_x = left // 16
-    video = source_video.new_zeros(video_shape)
+    source_latent = source_latent.to(accumulate_device)
+    source_y = top // 16
+    source_x = left // 16
+    video = source_latent.new_zeros(video_shape)
     video[
         :,
         :,
         :,
-        source_latent_y : source_latent_y + source_video.shape[-2],
-        source_latent_x : source_latent_x + source_video.shape[-1],
-    ].copy_(source_video)
+        source_y : source_y + source_latent.shape[-2],
+        source_x : source_x + source_latent.shape[-1],
+    ].copy_(source_latent)
 
     audio = torch.zeros(audio_shape, dtype=torch.float32, device=accumulate_device)
     video_mask = (
@@ -453,15 +453,7 @@ def _assemble_global_latent(
         "samples": comfy.nested_tensor.NestedTensor((video, audio)),
         "noise_mask": comfy.nested_tensor.NestedTensor((video_mask, audio_mask)),
     }
-    return (
-        latent,
-        source_video,
-        window_shapes,
-        specs,
-        observed_video_t,
-        top // 16,
-        left // 16,
-    )
+    return latent, window_shapes, specs
 
 
 def _sample_sliding_latent(
@@ -469,12 +461,8 @@ def _sample_sliding_latent(
     positive,
     negative,
     latent,
-    source_video,
     window_shapes,
     window_specs,
-    observed_video_t,
-    source_latent_y,
-    source_latent_x,
     seed,
     steps,
     sampler_name,
@@ -518,16 +506,6 @@ def _sample_sliding_latent(
                     "audio_latent": global_audio[
                         ..., audio_start:committed_audio_stop
                     ].contiguous(),
-                }
-            )
-        source_stop = min(video_stop, observed_video_t)
-        if source_stop > video_start:
-            keyframes.append(
-                {
-                    "resolved_frame_index": 0,
-                    "latent": source_video[:, :, video_start:source_stop].contiguous(),
-                    "latent_y": source_latent_y,
-                    "latent_x": source_latent_x,
                 }
             )
 
@@ -772,15 +750,7 @@ class _StreamingH3Video(Input.Video):
             self.model_top,
             comfy.model_management.intermediate_device(),
         )
-        (
-            latent,
-            source_video,
-            window_shapes,
-            window_specs,
-            observed_video_t,
-            source_latent_y,
-            source_latent_x,
-        ) = _assemble_global_latent(
+        latent, window_shapes, window_specs = _assemble_global_latent(
             source_frames,
             actual_count,
             self.video_vae,
@@ -797,12 +767,8 @@ class _StreamingH3Video(Input.Video):
             self.conditioning,
             self.conditioning,
             latent,
-            source_video,
             window_shapes,
             window_specs,
-            observed_video_t,
-            source_latent_y,
-            source_latent_x,
             self.seed,
             self.steps,
             self.sampler_name,
@@ -812,7 +778,7 @@ class _StreamingH3Video(Input.Video):
         comfy.model_management.unload_all_models()
         self.model = None
         self.conditioning = None
-        del sampled, latent, source_video, spatial_mask
+        del sampled, latent, spatial_mask
         gc.collect()
         comfy.model_management.soft_empty_cache()
 
