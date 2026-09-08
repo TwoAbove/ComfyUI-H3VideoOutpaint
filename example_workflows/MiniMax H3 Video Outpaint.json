@@ -410,6 +410,14 @@
             "name": "temporal_window_frames"
           },
           "link": null
+        },
+        {
+          "name": "source_pixels",
+          "type": "COMBO",
+          "widget": {
+            "name": "source_pixels"
+          },
+          "link": null
         }
       ],
       "outputs": [
@@ -474,7 +482,8 @@
         "res_multistep",
         "simple",
         "",
-        "auto"
+        "auto",
+        "exact"
       ],
       "widgets_values_named": {
         "skip_first_frames": 0,

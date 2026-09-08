@@ -17,6 +17,7 @@ import comfy.sample
 import comfy.utils
 import comfy.nested_tensor
 import comfy.samplers
+import node_helpers
 from comfy_api.latest import Input, Types
 from comfy_extras.nodes_minimax_h3 import (
     AUDIO_LATENT_FPS,
@@ -32,79 +33,77 @@ WINDOW_PIXEL_BUDGET = 90_000_000
 WINDOW_STRIDE_FRAMES = 2 * CONTEXT_FRAMES
 AUDIO_SAMPLE_RATE = 32000
 DENOISE_WINDOW_FRAMES = (56, 73, 90, 107, 124, 141, 158, 175, 192)
+LATENT_MULTIPLE = CANVAS_MULTIPLE // 2
 AUTO_DENOISE_WINDOW_FRAMES = DENOISE_WINDOW_FRAMES[:4]
+SEAM_TONE_ROWS = 4
 
 
 def _align_spatial(value):
     return max(CANVAS_MULTIPLE, math.ceil(value / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
 
 
-def _aligned_crop_geometry(width, height):
-    cropped_width = width // CANVAS_MULTIPLE * CANVAS_MULTIPLE
-    cropped_height = height // CANVAS_MULTIPLE * CANVAS_MULTIPLE
-    if cropped_width < CANVAS_MULTIPLE or cropped_height < CANVAS_MULTIPLE:
-        raise ValueError(
-            f"Source video {width}x{height} is smaller than one "
-            f"{CANVAS_MULTIPLE}-pixel H3 spatial chunk."
-        )
-    left = (width - cropped_width) // 2
-    top = (height - cropped_height) // 2
-    return (
-        cropped_width,
-        cropped_height,
-        left,
-        top,
-        width - cropped_width - left,
-        height - cropped_height - top,
-    )
+def _split_band(total):
+    near = total // 2 // LATENT_MULTIPLE * LATENT_MULTIPLE
+    return near, total - near
 
 
 def _best_effort_canvas(
-    source_width,
-    source_height,
+    input_width,
+    input_height,
     target_aspect,
     generation_megapixels,
     minimum_source_megapixels,
     max_upscale,
 ):
-    if source_width % CANVAS_MULTIPLE or source_height % CANVAS_MULTIPLE:
+    # The source is cropped only as far as the grids force it: the axis that
+    # gains bands keeps every row down to the 16 px latent grid, the fixed
+    # axis has to sit on the 32 px canvas grid.
+    source_width = input_width // LATENT_MULTIPLE * LATENT_MULTIPLE
+    source_height = input_height // LATENT_MULTIPLE * LATENT_MULTIPLE
+    if source_width < CANVAS_MULTIPLE or source_height < CANVAS_MULTIPLE:
         raise ValueError(
-            f"H3 source geometry must be divisible by {CANVAS_MULTIPLE}, got "
-            f"{source_width}x{source_height}."
+            f"Source video {input_width}x{input_height} is smaller than one "
+            f"{CANVAS_MULTIPLE}-pixel H3 spatial chunk."
         )
-    width = source_width
-    height = source_height
     if target_aspect == "source":
         target_ratio = source_width / source_height
     elif target_aspect == "9:12 portrait":
         target_ratio = 9.0 / 12.0
     else:
         raise ValueError(f"Unknown target aspect: {target_aspect}")
+    expand_height = source_width / source_height > target_ratio
+    expand_width = source_width / source_height < target_ratio
+    if not expand_width:
+        source_width = source_width // CANVAS_MULTIPLE * CANVAS_MULTIPLE
+    if not expand_height:
+        source_height = source_height // CANVAS_MULTIPLE * CANVAS_MULTIPLE
+    width = source_width
+    height = source_height
 
     candidates = [(width, height)]
-    if width / height > target_ratio:
+    if expand_height:
         target_height = _align_spatial(math.ceil(width / target_ratio))
         candidates.extend(
             (width, candidate_height)
             for candidate_height in range(
-                height + CANVAS_MULTIPLE, target_height + 1, CANVAS_MULTIPLE
+                _align_spatial(height + 2 * CANVAS_MULTIPLE),
+                target_height + 1,
+                CANVAS_MULTIPLE,
             )
         )
-    elif width / height < target_ratio:
+    elif expand_width:
         target_width = _align_spatial(math.ceil(height * target_ratio))
         candidates.extend(
             (candidate_width, height)
             for candidate_width in range(
-                width + CANVAS_MULTIPLE, target_width + 1, CANVAS_MULTIPLE
+                _align_spatial(width + 2 * CANVAS_MULTIPLE),
+                target_width + 1,
+                CANVAS_MULTIPLE,
             )
         )
 
     allowed = []
     for candidate_width, candidate_height in candidates:
-        if (candidate_width - source_width) % (2 * CANVAS_MULTIPLE) or (
-            candidate_height - source_height
-        ) % (2 * CANVAS_MULTIPLE):
-            continue
         model_width, model_height = _model_canvas(
             candidate_width,
             candidate_height,
@@ -117,8 +116,8 @@ def _best_effort_canvas(
         model_source_width, model_source_height, *_ = _scaled_source_geometry(
             source_width,
             source_height,
-            (candidate_width - source_width) // 2,
-            (candidate_height - source_height) // 2,
+            _split_band(candidate_width - source_width)[0],
+            _split_band(candidate_height - source_height)[0],
             candidate_width,
             candidate_height,
             model_width,
@@ -139,16 +138,9 @@ def _best_effort_canvas(
             ),
         )
 
-    left = (width - source_width) // 2
-    top = (height - source_height) // 2
-    return (
-        width,
-        height,
-        left,
-        top,
-        width - source_width - left,
-        height - source_height - top,
-    )
+    left, right = _split_band(width - source_width)
+    top, bottom = _split_band(height - source_height)
+    return width, height, source_width, source_height, left, top, right, bottom
 
 
 def _model_canvas(width, height, generation_megapixels):
@@ -186,23 +178,22 @@ def _scaled_source_geometry(
     model_width,
     model_height,
 ):
-    latent_multiple = CANVAS_MULTIPLE // 2
     left = (
-        round(source_x * model_width / canvas_width / latent_multiple) * latent_multiple
+        round(source_x * model_width / canvas_width / LATENT_MULTIPLE) * LATENT_MULTIPLE
     )
     top = (
-        round(source_y * model_height / canvas_height / latent_multiple)
-        * latent_multiple
+        round(source_y * model_height / canvas_height / LATENT_MULTIPLE)
+        * LATENT_MULTIPLE
     )
     right = (
-        round((source_x + source_width) * model_width / canvas_width / latent_multiple)
-        * latent_multiple
+        round((source_x + source_width) * model_width / canvas_width / LATENT_MULTIPLE)
+        * LATENT_MULTIPLE
     )
     bottom = (
         round(
-            (source_y + source_height) * model_height / canvas_height / latent_multiple
+            (source_y + source_height) * model_height / canvas_height / LATENT_MULTIPLE
         )
-        * latent_multiple
+        * LATENT_MULTIPLE
     )
     left = min(max(0, left), model_width - CANVAS_MULTIPLE)
     top = min(max(0, top), model_height - CANVAS_MULTIPLE)
@@ -385,7 +376,9 @@ def _global_window_starts(frame_count, window_frames):
             f"H3 global frame count {frame_count} cannot be covered by "
             f"{window_frames}-frame phase-aligned windows."
         )
-    return sorted({0, final_start, *range(0, final_start + 1, WINDOW_STRIDE_FRAMES)})
+    return sorted(
+        {0, final_start, *range(0, final_start + 1, WINDOW_STRIDE_FRAMES)}
+    )
 
 
 def _global_window_specs(frame_count, window_frames):
@@ -404,27 +397,70 @@ def _global_window_specs(frame_count, window_frames):
     return specs, window_video_t, window_audio_t
 
 
+def _pinned_span(offset, source_tokens, latent_tokens):
+    # The encoder folds whatever lies past the source edge into the outermost
+    # latent row, so pinning a band-facing edge row makes the model render that
+    # context (a border, or replicated rows). Leave it free; its real pixels
+    # are feathered back after decode.
+    start = offset + (offset > 0)
+    stop = offset + source_tokens - (offset + source_tokens < latent_tokens)
+    return start, stop
 
 
-def _spatial_generation_mask(
-    latent_h,
-    latent_w,
-    source_h,
-    source_w,
-    left,
-    top,
-    device,
-):
+def _spatial_generation_mask(latent_h, latent_w, source_h, source_w, left, top, device):
     mask = torch.ones((1, 1, latent_h, latent_w), dtype=torch.float32, device=device)
-    source_y = top // 16
-    source_x = left // 16
-    mask[
-        :,
-        :,
-        source_y : source_y + source_h // 16,
-        source_x : source_x + source_w // 16,
-    ] = 0.0
+    y0, y1 = _pinned_span(top // 16, source_h // 16, latent_h)
+    x0, x1 = _pinned_span(left // 16, source_w // 16, latent_w)
+    mask[:, :, y0:y1, x0:x1] = 0.0
     return mask
+
+
+def _seam_offset(generated, source):
+    # One RGB correction per frame; column-wise offsets imprint seam detail
+    # through the band as stripes.
+    return generated.mean((1, 2), keepdim=True) - source.mean((1, 2), keepdim=True)
+
+
+def _match_band_tone(frames, source, start, stop, free_start, free_stop, axis):
+    # The model renders each band with its own tone. Measure the step between
+    # the real source rows and the generated rows across the seam and ramp it
+    # out of the band; the free rows are corrected in full since the feathered
+    # composite hands over to them.
+    f = frames.movedim(axis, 1)
+    s = source.movedim(axis, 1)
+    rows = SEAM_TONE_ROWS
+    if start > 0:
+        offset = _seam_offset(f[:, start - rows : start], s[:, :rows])
+        ramp = torch.cat(
+            (torch.arange(1, start + 1, dtype=f.dtype).div_(start), torch.ones(free_start))
+        )
+        f[:, : start + free_start].sub_(offset * ramp.view(1, -1, 1, 1))
+    tail = f.shape[1] - stop
+    if tail > 0:
+        offset = _seam_offset(f[:, stop : stop + rows], s[:, -rows:])
+        ramp = torch.cat(
+            (torch.ones(free_stop), torch.arange(tail, 0, -1, dtype=f.dtype).div_(tail))
+        )
+        f[:, stop - free_stop :].sub_(offset * ramp.view(1, -1, 1, 1))
+
+
+def _source_weight(height, width, top, bottom, left, right):
+    # Real source pixels replace the decode, except on the free rows facing a
+    # band, where they fade into the decode so the seam stays a single
+    # decoder-continuous image.
+    rows = torch.ones(height)
+    cols = torch.ones(width)
+    if top:
+        rows[:top] = torch.linspace(0, 1, top)
+    if bottom:
+        rows[-bottom:] = torch.linspace(1, 0, bottom)
+    if left:
+        cols[:left] = torch.linspace(0, 1, left)
+    if right:
+        cols[-right:] = torch.linspace(1, 0, right)
+    rows = rows.square() * (3 - 2 * rows)
+    cols = cols.square() * (3 - 2 * cols)
+    return (rows.view(-1, 1) * cols.view(1, -1)).unsqueeze(-1)
 
 
 def _observed_video_tokens(frame_count, latent_t):
@@ -437,18 +473,6 @@ def _observed_video_tokens(frame_count, latent_t):
             return token_index
         observed_frames += span
     return latent_t
-
-
-def _conditioning_with_keyframes(conditioning, keyframes):
-    conditioned = []
-    for cross_attn, options in conditioning:
-        options = options.copy()
-        options["minimax_keyframes"] = [
-            *options.get("minimax_keyframes", ()),
-            *keyframes,
-        ]
-        conditioned.append([cross_attn, options])
-    return conditioned
 
 
 def _load_aligned_source_frames(
@@ -494,7 +518,6 @@ def _assemble_global_latent(
     specs, window_video_t, window_audio_t = _global_window_specs(
         aligned_count, denoise_window_frames
     )
-
     latent_height = (source_frames.shape[1] + top + bottom) // 16
     latent_width = (source_frames.shape[2] + left + right) // 16
     video_shape = (1, 24, global_video_t, latent_height, latent_width)
@@ -505,6 +528,8 @@ def _assemble_global_latent(
     ]
     accumulate_device = comfy.model_management.intermediate_device()
 
+    source_y = top // 16
+    source_x = left // 16
     source_input = source_frames.to(torch.float32).div_(255.0)
     source_latent = video_vae.encode(source_input)
     del source_input
@@ -523,8 +548,6 @@ def _assemble_global_latent(
             f"expected {source_shape}."
         )
     source_latent = source_latent.to(accumulate_device)
-    source_y = top // 16
-    source_x = left // 16
     video = source_latent.new_zeros(video_shape)
     video[
         :,
@@ -535,6 +558,7 @@ def _assemble_global_latent(
     ].copy_(source_latent)
 
     audio = torch.zeros(audio_shape, dtype=torch.float32, device=accumulate_device)
+    source_audio_condition = None
     observed_audio_t = 0
     if source_audio_latent is not None:
         if tuple(source_audio_latent.shape[:-1]) != audio_shape[:-1]:
@@ -546,34 +570,70 @@ def _assemble_global_latent(
         audio[..., :observed_audio_t].copy_(
             source_audio_latent[..., :observed_audio_t].to(accumulate_device)
         )
+        source_audio_condition = source_audio_latent[
+            ..., :observed_audio_t
+        ].to(accumulate_device)
 
-    video_mask = (
-        spatial_mask.to(accumulate_device)
-        .unsqueeze(2)
-        .expand(1, 1, global_video_t, -1, -1)
-        .clone()
-    )
-    video_mask[:, :, observed_video_t:] = 1.0
+    def temporal_mask(mask):
+        mask = (
+            mask.to(accumulate_device)
+            .unsqueeze(2)
+            .expand(1, 1, global_video_t, -1, -1)
+            .clone()
+        )
+        mask[:, :, observed_video_t:] = 1.0
+        return mask
+
     audio_mask = torch.ones(
         (1, 1, 2, global_audio_t),
         dtype=torch.float32,
         device=accumulate_device,
     )
     audio_mask[..., :observed_audio_t] = 0.0
+    # The DiT patchifies 2x2 latent tokens, so the keyframe is the
+    # patch-aligned interior of the pinned source rows.
+    y0, y1 = _pinned_span(source_y, source_latent.shape[-2], latent_height)
+    x0, x1 = _pinned_span(source_x, source_latent.shape[-1], latent_width)
+    key_y0 = (y0 + 1) // 2 * 2 - source_y
+    key_x0 = (x0 + 1) // 2 * 2 - source_x
+    key_y1 = y1 // 2 * 2 - source_y
+    key_x1 = x1 // 2 * 2 - source_x
     latent = {
         "samples": comfy.nested_tensor.NestedTensor((video, audio)),
-        "noise_mask": comfy.nested_tensor.NestedTensor((video_mask, audio_mask)),
+        "noise_mask": comfy.nested_tensor.NestedTensor(
+            (temporal_mask(spatial_mask), audio_mask)
+        ),
+        "source_keyframe": {
+            "latent": source_latent[
+                :, :, :observed_video_t, key_y0:key_y1, key_x0:key_x1
+            ].contiguous(),
+            "audio_latent": source_audio_condition,
+            "latent_y": source_y + key_y0,
+            "latent_x": source_x + key_x0,
+            "resolved_frame_index": 0,
+        },
     }
     return latent, window_shapes, specs
 
 
+def _reencode_generated(video_vae, sampled_video, window_video_mask):
+    # Committed latents feed the next window as hard ground truth. Model
+    # output drifts off the encoder manifold and that drift compounds window
+    # to window, so round-trip the generated tokens through the VAE first.
+    frames = video_vae.decode(sampled_video)[0]
+    clean = video_vae.encode(frames).to(
+        device=sampled_video.device, dtype=sampled_video.dtype
+    )
+    return torch.where(window_video_mask > 0, clean, sampled_video)
+
+
 def _sample_sliding_latent(
     model,
-    positive,
-    negative,
+    conditionings,
     latent,
     window_shapes,
     window_specs,
+    video_vae,
     seed,
     steps,
     sampler_name,
@@ -584,54 +644,69 @@ def _sample_sliding_latent(
     global_video_noise, global_audio_noise = comfy.sample.prepare_noise(
         latent["samples"], seed
     ).unbind()
+    source_keyframe = latent["source_keyframe"]
+    source_video = source_keyframe["latent"]
+    source_audio = source_keyframe["audio_latent"]
     window_video_t = window_shapes[0][2]
     window_audio_t = window_shapes[1][3]
     committed_video_stop = 0
     committed_audio_stop = 0
 
-    for _, video_start, audio_start in window_specs:
+    for conditioning, (_, video_start, audio_start) in zip(
+        conditionings, window_specs, strict=True
+    ):
         video_stop = video_start + window_video_t
         audio_stop = audio_start + window_audio_t
-        if video_start > committed_video_stop or audio_start > committed_audio_stop:
-            raise RuntimeError(
-                "H3 sliding windows left a gap in the latent trajectory."
-            )
-
-        video_overlap = committed_video_stop - video_start
-        audio_overlap = committed_audio_stop - audio_start
+        video_overlap = max(0, committed_video_stop - video_start)
+        audio_overlap = max(0, committed_audio_stop - audio_start)
+        source_video_stop = min(video_stop, source_video.shape[2])
+        source_audio_stop = (
+            min(audio_stop, source_audio.shape[-1])
+            if source_audio is not None else audio_start
+        )
         window_video = global_video[:, :, video_start:video_stop].contiguous()
         window_audio = global_audio[..., audio_start:audio_stop].contiguous()
-        window_video_mask = global_video_mask[:, :, video_start:video_stop].contiguous()
-        window_audio_mask = global_audio_mask[..., audio_start:audio_stop].contiguous()
-        window_video_mask[:, :, :video_overlap] = 0.0
-        window_audio_mask[..., :audio_overlap] = 0.0
-
-        keyframes = []
-        if video_overlap:
-            keyframes.append(
-                {
-                    "resolved_frame_index": 0,
-                    "latent": global_video[
-                        :, :, video_start:committed_video_stop
-                    ].contiguous(),
-                    "audio_latent": global_audio[
-                        ..., audio_start:committed_audio_stop
-                    ].contiguous(),
-                }
-            )
-
-        window_latent = comfy.nested_tensor.NestedTensor((window_video, window_audio))
-        window_mask = comfy.nested_tensor.NestedTensor(
-            (window_video_mask, window_audio_mask)
-        )
+        window_video_mask = global_video_mask[:, :, video_start:video_stop].clone()
+        window_audio_mask = global_audio_mask[..., audio_start:audio_stop].clone()
         window_noise = comfy.nested_tensor.NestedTensor(
             (
                 global_video_noise[:, :, video_start:video_stop].contiguous(),
                 global_audio_noise[..., audio_start:audio_stop].contiguous(),
             )
         )
-        window_positive = _conditioning_with_keyframes(positive, keyframes)
-        window_negative = _conditioning_with_keyframes(negative, keyframes)
+        keyframes = []
+        if video_start < source_video_stop or (
+            source_audio is not None and audio_start < source_audio_stop
+        ):
+            keyframes.append(
+                {
+                    "latent": source_video[:, :, video_start:source_video_stop].contiguous()
+                    if video_start < source_video_stop else None,
+                    "audio_latent": source_audio[..., audio_start:source_audio_stop].contiguous()
+                    if source_audio is not None and audio_start < source_audio_stop
+                    else None,
+                    "latent_y": source_keyframe["latent_y"],
+                    "latent_x": source_keyframe["latent_x"],
+                    "resolved_frame_index": 0,
+                }
+            )
+        if video_overlap or audio_overlap:
+            window_video_mask[:, :, :video_overlap] = 0.0
+            window_audio_mask[..., :audio_overlap] = 0.0
+            keyframes.append(
+                {
+                    "latent": global_video[
+                        :, :, video_start:committed_video_stop
+                    ].contiguous(),
+                    "audio_latent": global_audio[
+                        ..., audio_start:committed_audio_stop
+                    ].contiguous(),
+                    "resolved_frame_index": 0,
+                }
+            )
+        conditioned = node_helpers.conditioning_set_values(
+            conditioning, {"minimax_keyframes": keyframes}
+        )
         sampled = comfy.sample.sample(
             model,
             window_noise,
@@ -639,33 +714,35 @@ def _sample_sliding_latent(
             1.0,
             sampler_name,
             scheduler,
-            window_positive,
-            window_negative,
-            window_latent,
+            conditioned,
+            conditioned,
+            comfy.nested_tensor.NestedTensor((window_video, window_audio)),
             denoise=1.0,
-            noise_mask=window_mask,
-            disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
+            noise_mask=comfy.nested_tensor.NestedTensor(
+                (window_video_mask, window_audio_mask)
+            ),
             seed=seed,
         )
         sampled_video, sampled_audio = sampled.unbind()
-
-        video_commit_start = max(video_start, committed_video_stop)
-        audio_commit_start = max(audio_start, committed_audio_stop)
-        global_video[:, :, video_commit_start:video_stop].copy_(
-            sampled_video[:, :, video_commit_start - video_start :]
+        sampled_video = _reencode_generated(
+            video_vae, sampled_video, window_video_mask
         )
-        global_audio[..., audio_commit_start:audio_stop].copy_(
-            sampled_audio[..., audio_commit_start - audio_start :]
+        commit_video_start = max(committed_video_stop, video_start)
+        commit_audio_start = max(committed_audio_stop, audio_start)
+        global_video[:, :, commit_video_start:video_stop].copy_(
+            sampled_video[:, :, commit_video_start - video_start:]
+        )
+        global_audio[..., commit_audio_start:audio_stop].copy_(
+            sampled_audio[..., commit_audio_start - audio_start:]
         )
         committed_video_stop = video_stop
         committed_audio_stop = audio_stop
 
-    if (
-        committed_video_stop != global_video.shape[2]
-        or committed_audio_stop != global_audio.shape[3]
-    ):
-        raise RuntimeError("H3 sliding windows did not complete the latent trajectory.")
-    return {"samples": comfy.nested_tensor.NestedTensor((global_video, global_audio))}
+    return {
+        "samples": comfy.nested_tensor.NestedTensor(
+            (global_video, global_audio)
+        )
+    }
 
 
 class _StreamingH3Video(Input.Video):
@@ -673,7 +750,8 @@ class _StreamingH3Video(Input.Video):
         self,
         source_video,
         model,
-        conditioning,
+        clip,
+        prompt,
         video_vae,
         audio_vae,
         skip_first_frames,
@@ -687,10 +765,12 @@ class _StreamingH3Video(Input.Video):
         sampler_name,
         scheduler,
         temporal_window_frames="auto",
+        source_pixels="exact",
     ):
         self.source_video = source_video
         self.model = model.clone()
-        self.conditioning = conditioning
+        self.clip = clip
+        self.prompt = prompt
         self.video_vae = video_vae
         self.audio_vae = audio_vae
         self.skip_first_frames = int(skip_first_frames)
@@ -705,14 +785,6 @@ class _StreamingH3Video(Input.Video):
         self.scheduler = scheduler
 
         self.input_width, self.input_height = source_video.get_dimensions()
-        (
-            self.source_width,
-            self.source_height,
-            self.crop_left,
-            self.crop_top,
-            self.crop_right,
-            self.crop_bottom,
-        ) = _aligned_crop_geometry(self.input_width, self.input_height)
         source_count = source_video.get_frame_count() - self.skip_first_frames
         if self.frame_load_cap:
             source_count = min(source_count, self.frame_load_cap)
@@ -725,24 +797,26 @@ class _StreamingH3Video(Input.Video):
         (
             self.width,
             self.height,
+            self.source_width,
+            self.source_height,
             self.left,
             self.top,
             self.right,
             self.bottom,
         ) = _best_effort_canvas(
-            self.source_width,
-            self.source_height,
+            self.input_width,
+            self.input_height,
             self.target_aspect,
             self.generation_megapixels,
             self.minimum_source_megapixels,
             self.max_upscale,
         )
-        self.model_width = self.width
-        self.model_height = self.height
-        self.generated_upscale = 1.0
+        self.crop_left = (self.input_width - self.source_width) // 2
+        self.crop_top = (self.input_height - self.source_height) // 2
+        self.composite_source = source_pixels == "exact"
         if temporal_window_frames == "auto":
             self.denoise_window_frames = _auto_denoise_window_frames(
-                self.model_width, self.model_height
+                self.width, self.height
             )
         elif temporal_window_frames == "global":
             self.denoise_window_frames = None
@@ -753,17 +827,8 @@ class _StreamingH3Video(Input.Video):
                     "Unsupported H3 temporal window: "
                     f"{self.denoise_window_frames} frames."
                 )
-        self.model_source_width = self.source_width
-        self.model_source_height = self.source_height
-        self.model_left = self.left
-        self.model_top = self.top
-        self.model_right = self.right
-        self.model_bottom = self.bottom
-        self.model_source_megapixels = (
-            self.model_source_width * self.model_source_height / 1_000_000
-        )
 
-    def prepare_conditioning(self, clip, prompt):
+    def prepare_conditioning(self):
         actual_count = _count_video_frames(
             self.source_video,
             self.skip_first_frames,
@@ -771,9 +836,22 @@ class _StreamingH3Video(Input.Video):
         )
         self.source_frame_count = actual_count
         self.frame_count = temporal_shape(actual_count)[0]
-        self.conditioning = clip.encode_from_tokens_scheduled(
-            clip.tokenize(prompt)
-        )
+
+    def _window_conditionings(self, source_frames, window_frames):
+        # fl2va shows every anchored keyframe to Qwen as <Picture 1> as well
+        # as to the DiT, so each window's text context carries its own
+        # opening source frame; the prompt may be empty.
+        conditionings = []
+        for frame_start in _global_window_starts(
+            int(source_frames.shape[0]), window_frames
+        ):
+            frame = source_frames[frame_start : frame_start + 1].to(torch.float32).div_(255.0)
+            conditionings.append(
+                self.clip.encode_from_tokens_scheduled(
+                    self.clip.tokenize(self.prompt, images=[frame])
+                )
+            )
+        return conditionings
 
     def get_components(self):
         raise RuntimeError(
@@ -802,6 +880,39 @@ class _StreamingH3Video(Input.Video):
         strict_duration=False,
     ):
         return None
+
+    def _composite_source(self, frames, source_frames):
+        # Source frames are ground truth; the decoder only approximates them.
+        source = source_frames.to(torch.float32).div_(255.0)
+        source_stop_y = self.top + self.source_height
+        source_stop_x = self.left + self.source_width
+        pinned_y = _pinned_span(
+            self.top // 16, self.source_height // 16, self.height // 16
+        )
+        pinned_x = _pinned_span(
+            self.left // 16, self.source_width // 16, self.width // 16
+        )
+        free_top = pinned_y[0] * 16 - self.top
+        free_bottom = source_stop_y - pinned_y[1] * 16
+        free_left = pinned_x[0] * 16 - self.left
+        free_right = source_stop_x - pinned_x[1] * 16
+        _match_band_tone(
+            frames, source, self.top, source_stop_y, free_top, free_bottom, 1
+        )
+        _match_band_tone(
+            frames, source, self.left, source_stop_x, free_left, free_right, 2
+        )
+        frames[:, self.top : source_stop_y, self.left : source_stop_x].lerp_(
+            source,
+            _source_weight(
+                self.source_height,
+                self.source_width,
+                free_top,
+                free_bottom,
+                free_left,
+                free_right,
+            ),
+        )
 
     def _encode_output_frame(self, output, stream, frame):
         image = (
@@ -892,34 +1003,33 @@ class _StreamingH3Video(Input.Video):
             else min(self.denoise_window_frames, aligned_count)
         )
         spatial_mask = _spatial_generation_mask(
-            self.model_height // 16,
-            self.model_width // 16,
-            self.model_source_height,
-            self.model_source_width,
-            self.model_left,
-            self.model_top,
+            self.height // 16,
+            self.width // 16,
+            self.source_height,
+            self.source_width,
+            self.left,
+            self.top,
             comfy.model_management.intermediate_device(),
         )
         latent, window_shapes, window_specs = _assemble_global_latent(
             source_frames,
             actual_count,
             self.video_vae,
-            self.model_left,
-            self.model_top,
-            self.model_right,
-            self.model_bottom,
+            self.left,
+            self.top,
+            self.right,
+            self.bottom,
             spatial_mask,
             source_audio_latent,
             window_frames,
         )
-        del source_frames
         sampled = _sample_sliding_latent(
             self.model,
-            self.conditioning,
-            self.conditioning,
+            self._window_conditionings(source_frames, window_frames),
             latent,
             window_shapes,
             window_specs,
+            self.video_vae,
             self.seed,
             self.steps,
             self.sampler_name,
@@ -928,18 +1038,12 @@ class _StreamingH3Video(Input.Video):
         sampled_video, sampled_audio = sampled["samples"].unbind()
         comfy.model_management.unload_all_models()
         self.model = None
-        self.conditioning = None
+        self.clip = None
         del sampled, latent, spatial_mask, source_audio_latent
         gc.collect()
         comfy.model_management.soft_empty_cache()
 
-        decoded_frames = self.video_vae.decode(sampled_video)
-        if decoded_frames.ndim == 5:
-            if decoded_frames.shape[0] != 1:
-                raise RuntimeError(
-                    f"H3 VAE decoded batch {decoded_frames.shape[0]}; expected 1."
-                )
-            decoded_frames = decoded_frames[0]
+        decoded_frames = self.video_vae.decode(sampled_video)[0]
         if decoded_frames.shape[0] != aligned_count:
             raise RuntimeError(
                 f"H3 VAE decoded {decoded_frames.shape[0]} frames; "
@@ -947,6 +1051,9 @@ class _StreamingH3Video(Input.Video):
             )
         decoded_frames = decoded_frames.to(device="cpu", dtype=torch.float32)
         del sampled_video
+        if self.composite_source:
+            self._composite_source(decoded_frames[:actual_count], source_frames[:actual_count])
+        del source_frames
         output_audio = None
         if source_audio is not None:
             output_sample_count = round(
@@ -1149,13 +1256,21 @@ class MiniMaxH3SimpleVideoOutpaint:
                         "default": "",
                         "multiline": True,
                         "dynamicPrompts": True,
+                        "tooltip": "Optional MiniMax H3 scene description: setting, lighting, subjects, camera, and what is beyond each edge (for example a purple wall above, a wooden floor below). Each window also sees its opening source frame, so an empty prompt works; the prompt steers band content and does not correct band tone. Do not write that the frame continues above and below: on uniform, texture-like scenes the model then repeats the source in the bands.",
                     },
                 ),
                 "temporal_window_frames": (
                     ["auto", "107", "124", "158", "192", "global"],
                     {
                         "default": "auto",
-                        "tooltip": "Transformer context per denoiser call. Auto stays at or below the validated 107-frame policy; manual values are unchanged. Matching validation found expanded-region artifacts at 192 for the cc58 source.",
+                        "tooltip": "Transformer context per denoiser call. auto picks the largest window up to 107 frames that fits the canvas; larger windows cost memory and destabilise the bands.",
+                    },
+                ),
+                "source_pixels": (
+                    ["exact", "decoded"],
+                    {
+                        "default": "exact",
+                        "tooltip": "exact: the real source pixels are composited over the decode with a per-frame RGB tone match at each seam and a 16 px fade at each band edge. decoded: the whole frame is the VAE decode, so the seam is decoder-continuous but the source is a VAE reconstruction (about 3 px MAE softer).",
                     },
                 ),
             },
@@ -1186,11 +1301,13 @@ class MiniMaxH3SimpleVideoOutpaint:
         scheduler,
         prompt="",
         temporal_window_frames="auto",
+        source_pixels="exact",
     ):
         video = _StreamingH3Video(
             source_video=source_video,
             model=model,
-            conditioning=None,
+            clip=clip,
+            prompt=prompt,
             video_vae=video_vae,
             audio_vae=audio_vae,
             skip_first_frames=skip_first_frames,
@@ -1204,8 +1321,9 @@ class MiniMaxH3SimpleVideoOutpaint:
             sampler_name=sampler_name,
             scheduler=scheduler,
             temporal_window_frames=temporal_window_frames,
+            source_pixels=source_pixels,
         )
-        video.prepare_conditioning(clip, prompt)
+        video.prepare_conditioning()
         denoise_window = (
             "global"
             if video.denoise_window_frames is None
@@ -1217,13 +1335,8 @@ class MiniMaxH3SimpleVideoOutpaint:
             f"{video.source_frame_count} source frames -> "
             f"{video.frame_count} H3-aligned output frames; "
             f"internal {FPS} fps, delivered at {float(video.source_frame_rate):g} fps; "
-            f"H3 canvas={video.model_width}x{video.model_height}, "
-            f"source={video.model_source_megapixels:.3f} MP "
-            f"(floor {float(minimum_source_megapixels):g} MP), "
-            f"resize={video.generated_upscale:.3f}x (limit {float(max_upscale):g}x), "
-            f"denoiser window={denoise_window} frames. "
-            "Each completed overlap conditions the next window; Save Video encodes "
-            "the assembled latent once."
+            f"denoiser window={denoise_window} frames; "
+            f"source pixels {source_pixels}."
         )
         return (
             video,

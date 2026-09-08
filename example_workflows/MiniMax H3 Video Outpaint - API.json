@@ -70,7 +70,8 @@
       "frame_load_cap": 0,
       "max_upscale": 1.5,
       "minimum_source_megapixels": 0.7,
-      "temporal_window_frames": "auto"
+      "temporal_window_frames": "auto",
+      "source_pixels": "exact"
     }
   },
   "7": {

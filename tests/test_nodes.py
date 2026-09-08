@@ -59,7 +59,7 @@ class FakeVAE:
             for index in range(latent.shape[2])
         )
         return torch.full(
-            (frame_count, latent.shape[-2] * 16, latent.shape[-1] * 16, 3),
+            (1, frame_count, latent.shape[-2] * 16, latent.shape[-1] * 16, 3),
             0.25,
         )
 
@@ -77,7 +77,6 @@ class FakeAudioVAE:
         self.decoded.append(latent.clone())
         waveform = latent.mean(dim=1).repeat_interleave(800, dim=-1)
         return waveform.movedim(1, -1)
-
 
 
 class FakeLazyVideo(h3_nodes.Input.Video):
@@ -117,144 +116,215 @@ class FakeLazyVideo(h3_nodes.Input.Video):
 
 class WindowingTests(unittest.TestCase):
     def test_sliding_windows_are_phase_aligned_and_cover_timeline(self):
-        frame_count = 634
-        window_frames = 73
-        starts = h3_nodes._global_window_starts(frame_count, window_frames)
+        starts = h3_nodes._global_window_starts(634, 73)
 
         self.assertEqual(starts[0], 0)
-        self.assertEqual(starts[-1], frame_count - window_frames)
-        self.assertEqual(len(starts), 18)
-        self.assertTrue(all(start % h3_nodes.CONTEXT_FRAMES == 0 for start in starts))
-        covered = {
-            frame_index
-            for start in starts
-            for frame_index in range(start, start + window_frames)
-        }
-        self.assertEqual(covered, set(range(frame_count)))
+        self.assertEqual(starts[-1], 561)
         self.assertTrue(
-            all(
-                previous + window_frames > current
-                for previous, current in zip(starts, starts[1:])
-            )
+            all(start % h3_nodes.CONTEXT_FRAMES == 0 for start in starts)
+        )
+        self.assertEqual(
+            {
+                frame
+                for start in starts
+                for frame in range(start, start + 73)
+            },
+            set(range(634)),
         )
 
-    def test_sliding_sampler_freezes_overlap_and_commits_only_new_tokens(self):
-        frame_count = 107
-        specs, window_video_t, window_audio_t = h3_nodes._global_window_specs(
-            frame_count, 73
-        )
-        _, global_video_t, global_audio_t = h3_nodes.temporal_shape(frame_count)
-        global_video = torch.zeros((1, 1, global_video_t, 1, 1))
-        global_audio = torch.zeros((1, 1, 2, global_audio_t))
-        video_mask = torch.ones((1, 1, global_video_t, 1, 1))
-        audio_mask = torch.ones((1, 1, 2, global_audio_t))
+    def test_completed_overlap_is_reencoded_hard_input_to_next_window(self):
+        video = torch.zeros((1, 24, 32, 4, 2))
+        video[:, :, :, 1:3, 0] = 7
+        audio = torch.zeros((1, 32, 2, 18))
+        video_mask = torch.ones((1, 1, 32, 4, 2))
+        video_mask[:, :, :, 1:3, 0] = 0
+        audio_mask = torch.ones((1, 1, 2, 18))
         latent = {
             "samples": h3_nodes.comfy.nested_tensor.NestedTensor(
-                (global_video, global_audio)
+                (video, audio)
             ),
             "noise_mask": h3_nodes.comfy.nested_tensor.NestedTensor(
                 (video_mask, audio_mask)
             ),
+            "source_keyframe": {
+                "latent": torch.full((1, 24, 32, 2, 1), 7.0),
+                "audio_latent": None,
+                "latent_y": 1,
+                "latent_x": 0,
+                "resolved_frame_index": 0,
+            },
         }
+        window_shapes = [(1, 24, 22, 4, 2), (1, 32, 2, 12)]
+        specs = [(0, 0, 0), (34, 10, 6)]
         conditioning = [[torch.zeros((1, 1, 1)), {}]]
         calls = []
 
+        class MarkingVAE(FakeVAE):
+            def encode(self, frames):
+                latent = super().encode(frames)
+                return torch.full_like(latent, 10.0 + len(self.encoded))
+
+        vae = MarkingVAE()
+
         def sample(*args, **kwargs):
-            window_video, window_audio = args[8].unbind()
-            sampled_video = torch.full_like(window_video, 10.0 * (len(calls) + 1))
-            sampled_audio = torch.full_like(window_audio, 10.0 * (len(calls) + 1))
+            local_video, local_audio = args[8].unbind()
+            local_video_mask, local_audio_mask = kwargs[
+                "noise_mask"
+            ].unbind()
+            keyframes = args[6][0][1]["minimax_keyframes"]
+            self.assertIs(args[6], args[7])
             calls.append(
                 {
-                    "mask": kwargs["noise_mask"],
-                    "keyframes": args[6][0][1]["minimax_keyframes"],
+                    "video": local_video.clone(),
+                    "video_mask": local_video_mask.clone(),
+                    "keyframes": keyframes,
                 }
+            )
+            value = float(len(calls) * 2)
+            sampled_video = torch.where(
+                local_video_mask.bool(),
+                torch.full_like(local_video, value),
+                local_video,
+            )
+            sampled_audio = torch.where(
+                local_audio_mask.bool(),
+                torch.full_like(local_audio, value),
+                local_audio,
             )
             return h3_nodes.comfy.nested_tensor.NestedTensor(
                 (sampled_video, sampled_audio)
             )
 
-        with patch.object(h3_nodes.comfy.sample, "sample", side_effect=sample):
-            sampled = h3_nodes._sample_sliding_latent(
+        zero_noise = h3_nodes.comfy.nested_tensor.NestedTensor(
+            (torch.zeros_like(video), torch.zeros_like(audio))
+        )
+        with (
+            patch.object(
+                h3_nodes.comfy.sample,
+                "prepare_noise",
+                return_value=zero_noise,
+            ),
+            patch.object(
+                h3_nodes.comfy.sample,
+                "sample",
+                side_effect=sample,
+            ),
+        ):
+            result = h3_nodes._sample_sliding_latent(
                 FakeModel(),
-                conditioning,
-                conditioning,
+                [conditioning, conditioning],
                 latent,
-                [
-                    (1, 1, window_video_t, 1, 1),
-                    (1, 1, 2, window_audio_t),
-                ],
+                window_shapes,
                 specs,
-                7,
+                vae,
                 1,
+                20,
                 "res_multistep",
                 "simple",
             )
 
-        self.assertEqual(len(calls), 2)
-        second_video_mask, second_audio_mask = calls[1]["mask"].unbind()
-        self.assertTrue(torch.all(second_video_mask[:, :, :12] == 0))
-        self.assertTrue(torch.all(second_video_mask[:, :, 12:] == 1))
-        self.assertTrue(torch.all(second_audio_mask[..., :66] == 0))
-        self.assertTrue(torch.all(second_audio_mask[..., 66:] == 1))
-        self.assertEqual(calls[0]["keyframes"], [])
-        (overlap_keyframe,) = calls[1]["keyframes"]
-        self.assertEqual(overlap_keyframe["latent"].shape[2], 12)
-        self.assertTrue(torch.all(overlap_keyframe["latent"] == 10))
-        self.assertEqual(overlap_keyframe["audio_latent"].shape[3], 66)
-        self.assertTrue(torch.all(overlap_keyframe["audio_latent"] == 10))
+        result_video, result_audio = result["samples"].unbind()
+        first, second = calls
 
-        sampled_video, sampled_audio = sampled["samples"].unbind()
-        self.assertTrue(torch.all(sampled_video[:, :, :window_video_t] == 10))
-        self.assertTrue(torch.all(sampled_video[:, :, window_video_t:] == 20))
-        self.assertTrue(torch.all(sampled_audio[..., :window_audio_t] == 10))
-        self.assertTrue(torch.all(sampled_audio[..., window_audio_t:] == 20))
+        # window 1: pinned source tokens, standalone source keyframe
+        self.assertTrue(torch.all(first["video"][:, :, :, 1:3, 0] == 7))
+        self.assertTrue(torch.all(first["video_mask"][:, :, :, 1:3, 0] == 0))
+        self.assertTrue(torch.all(first["video_mask"][:, :, :, :, 1] == 1))
+        self.assertEqual(len(first["keyframes"]), 1)
+        self.assertTrue(torch.all(first["keyframes"][0]["latent"] == 7))
+
+        # generated tokens are VAE round-tripped before commit; pinned ones are not
+        self.assertEqual(len(vae.decoded), 2)
+        self.assertEqual(tuple(vae.decoded[0].shape), (1, 24, 22, 4, 2))
+
+        # window 2: overlap tokens are the re-encoded output of window 1 and
+        # arrive both pinned and as a keyframe
+        self.assertTrue(torch.all(result_video[:, :, :22, 1:3, 0] == 7))
+        self.assertTrue(torch.all(result_video[:, :, :22, :, 1] == 11))
+        self.assertTrue(torch.all(second["video"][:, :, :12, :, 1] == 11))
+        self.assertTrue(torch.all(second["video_mask"][:, :, :12] == 0))
+        self.assertEqual(len(second["keyframes"]), 2)
+        self.assertTrue(torch.all(second["keyframes"][1]["latent"][:, :, :, :, 1] == 11))
+        self.assertTrue(torch.all(result_video[:, :, 22:, :, 1] == 12))
+        self.assertTrue(torch.all(result_audio[..., :12] == 2))
+        self.assertTrue(torch.all(result_audio[..., 12:] == 4))
+
+    def test_spatial_keyframe_uses_its_source_grid_rows(self):
+        source = torch.zeros((1, 24, 22, 44, 78))
+        layout = h3_nodes.comfy.ldm.minimax.model.PackedLayout(
+            1,
+            22,
+            60,
+            78,
+            122,
+            keyframes=[
+                {
+                    "latent": source,
+                    "latent_y": 8,
+                    "latent_x": 0,
+                    "resolved_frame_index": 0,
+                }
+            ],
+        )
+
+        cond_start, cond_stop, kind = layout.segments[1]
+        self.assertEqual(kind, "cond")
+        self.assertEqual(cond_stop - cond_start, 22 * 22 * 39)
 
 
 class MaskOwnershipTests(unittest.TestCase):
-    def test_cc58_mask_generates_only_outside_the_source(self):
+    def test_mask_leaves_band_facing_edge_rows_free(self):
         mask = h3_nodes._spatial_generation_mask(
-            latent_h=60,
-            latent_w=78,
-            source_h=704,
-            source_w=1248,
-            left=0,
-            top=128,
-            device=torch.device("cpu"),
+            60, 78, 720, 1248, 0, 112, torch.device("cpu")
         )[0, 0]
 
+        # source rows are tokens 7:52; the encoder folds the band context into
+        # rows 7 and 51, so only 8:51 are pinned; the columns touch the canvas
         self.assertTrue(torch.all((mask == 0) | (mask == 1)))
         self.assertTrue(torch.all(mask[:8] == 1))
-        self.assertTrue(torch.all(mask[8:52] == 0))
-        self.assertTrue(torch.all(mask[52:] == 1))
+        self.assertTrue(torch.all(mask[8:51] == 0))
+        self.assertTrue(torch.all(mask[51:] == 1))
+        self.assertEqual(h3_nodes._pinned_span(0, 78, 78), (0, 78))
+
+    def test_band_tone_is_matched_to_source_and_composite_feathers_the_free_rows(self):
+        # decode: top band and its 16 free rows +0.1, bottom band and its 32
+        # free rows -0.2 red; the interior decodes close to the source
+        source = torch.full((2, 64, 64, 3), 0.5)
+        frames = torch.full((2, 128, 64, 3), 0.5)
+        frames[:, :48] += 0.1
+        frames[:, 64:, :, 0] -= 0.2
+
+        h3_nodes._match_band_tone(frames, source, 32, 96, 16, 32, 1)
+        frames[:, 32:96].lerp_(source, h3_nodes._source_weight(64, 64, 16, 32, 0, 0))
+
+        self.assertTrue(torch.equal(frames[:, 48:64], source[:, 16:32]))
+        self.assertTrue(torch.allclose(frames[:, 31:97], torch.full((2, 66, 64, 3), 0.5), atol=1e-6))
+        self.assertTrue(torch.all((frames[:, 30] - 0.5).abs() < 0.01))
+        self.assertTrue(torch.all((frames[:, 97, :, 0] - 0.5).abs() < 0.01))
+        # the far edge keeps most of the band's own tone
+        self.assertTrue(torch.all(frames[:, 0] > 0.59))
+        self.assertTrue(torch.all(frames[:, 127, :, 0] < 0.31))
+
+    def test_seam_detail_does_not_extend_as_stripes_through_band(self):
+        source = torch.full((2, 64, 64, 3), 0.5)
+        source[:, -4:, 24:40] += 0.2
+        frames = torch.full((2, 128, 64, 3), 0.6)
+
+        h3_nodes._match_band_tone(frames, source, 32, 96, 16, 16, 1)
+
+        self.assertTrue(torch.allclose(frames[:, 104], frames[:, 104, :1].expand(-1, 64, -1)))
+
+    def test_source_weight_fades_only_toward_bands(self):
+        weight = h3_nodes._source_weight(48, 40, 0, 32, 16, 0)[..., 0]
+        self.assertTrue(torch.all(weight[:16, 16:] == 1))
+        self.assertTrue(torch.all(weight[-1] == 0))
+        self.assertTrue(torch.all(weight[:, 0] == 0))
+        self.assertTrue(torch.all(weight[1:, 20] <= weight[:-1, 20]))
+        self.assertTrue(torch.all(weight[0, 1:] >= weight[0, :-1]))
 
     def test_621_source_frames_leave_four_future_tokens_for_generation(self):
         self.assertEqual(h3_nodes.temporal_shape(621), (634, 187, 1057))
         self.assertEqual(h3_nodes._observed_video_tokens(621, 187), 183)
-
-    def test_keyframes_use_native_conditioning_metadata(self):
-        existing = {"resolved_frame_index": 9, "latent": torch.zeros(1)}
-        keyframe = {
-            "resolved_frame_index": 0,
-            "latent": torch.randn((1, 24, 5, 2, 4)),
-        }
-        conditioning = [
-            [torch.zeros((1, 1, 1)), {"minimax_keyframes": [existing]}]
-        ]
-
-        conditioned = h3_nodes._conditioning_with_keyframes(
-            conditioning, [keyframe]
-        )
-
-        self.assertIs(
-            conditioned[0][1]["minimax_keyframes"][0],
-            existing,
-        )
-        self.assertIs(
-            conditioned[0][1]["minimax_keyframes"][1],
-            keyframe,
-        )
-        self.assertIsNot(conditioned[0][1], conditioning[0][1])
-
 
     def test_global_latent_copies_one_source_encoding_into_target(self):
         source_count = 103
@@ -266,16 +336,10 @@ class MaskOwnershipTests(unittest.TestCase):
         )
         vae = FakeVAE()
         spatial_mask = h3_nodes._spatial_generation_mask(
-            20,
-            2,
-            288,
-            32,
-            0,
-            16,
-            torch.device("cpu"),
+            20, 2, 288, 32, 0, 16, torch.device("cpu")
         )
 
-        latent, window_shapes, specs = h3_nodes._assemble_global_latent(
+        latent, window_shapes, _ = h3_nodes._assemble_global_latent(
             source,
             source_count,
             vae,
@@ -293,44 +357,34 @@ class MaskOwnershipTests(unittest.TestCase):
             source_count, video_mask.shape[2]
         )
 
+        # standalone source encode copied into the target; the edge rows 1 and
+        # 18 are copied but left free in the mask
         self.assertEqual(len(vae.encoded), 1)
-        self.assertEqual(
-            vae.encoded[0].shape,
-            (aligned_count, 288, 32, 3),
-        )
+        self.assertEqual(vae.encoded[0].shape, (aligned_count, 288, 32, 3))
         self.assertTrue(torch.all(video[:, :, :, :1] == 0))
         self.assertTrue(torch.all(video[:, :, :, 1:19] == 1))
         self.assertTrue(torch.all(video[:, :, :, 19:] == 0))
-        self.assertTrue(
-            torch.all(video_mask[:, :, :observed, 1:19] == 0)
-        )
-        self.assertTrue(
-            torch.all(video_mask[:, :, :observed, :1] == 1)
-        )
-        self.assertTrue(
-            torch.all(video_mask[:, :, :observed, 19:] == 1)
-        )
+        self.assertTrue(torch.all(video_mask[:, :, :observed, 2:18] == 0))
+        self.assertTrue(torch.all(video_mask[:, :, :observed, :2] == 1))
+        self.assertTrue(torch.all(video_mask[:, :, :observed, 18:] == 1))
         self.assertTrue(torch.all(video_mask[:, :, observed:] == 1))
         self.assertEqual(
             window_shapes[0][2],
             h3_nodes.temporal_shape(73)[1],
         )
-        self.assertEqual(specs, [(0, 0, 0), (34, 10, 56)])
-
-
+        # pinned rows are 2:18, already 2x2-patch aligned, so the keyframe is
+        # exactly those rows
+        keyframe = latent["source_keyframe"]
+        self.assertEqual(keyframe["latent_y"], 2)
+        self.assertEqual(tuple(keyframe["latent"].shape), (1, 24, observed, 16, 2))
+        self.assertTrue(torch.all(keyframe["latent"] == 1))
 
     def test_global_latent_preserves_source_audio_and_generates_tail(self):
         source_count = 18
         aligned_count, _, global_audio_t = h3_nodes.temporal_shape(source_count)
         source = torch.zeros((aligned_count, 32, 64, 3), dtype=torch.uint8)
         spatial_mask = h3_nodes._spatial_generation_mask(
-            6,
-            4,
-            32,
-            64,
-            0,
-            32,
-            torch.device("cpu"),
+            6, 4, 32, 64, 0, 32, torch.device("cpu")
         )
         source_audio = torch.full((1, 32, 2, 30), 0.5)
 
@@ -368,7 +422,8 @@ class GeometryTests(unittest.TestCase):
             video = h3_nodes._StreamingH3Video(
                 source_video=source,
                 model=FakeModel(),
-                conditioning=None,
+                clip=FakeClip(),
+                prompt="",
                 video_vae=FakeVAE(),
                 audio_vae=None,
                 skip_first_frames=0,
@@ -387,19 +442,29 @@ class GeometryTests(unittest.TestCase):
             self.assertEqual(video.frame_rate, h3_nodes.Fraction(30, 1))
             self.assertEqual(video.frame_count, 192)
 
-    def test_cc58_geometry_crops_and_places_on_h3_boundaries(self):
-        geometry = h3_nodes._aligned_crop_geometry(1254, 720)
-        self.assertEqual(geometry, (1248, 704, 3, 8, 3, 8))
-
+    def test_1254x720_geometry_keeps_every_source_row_on_the_expanded_axis(self):
         canvas = h3_nodes._best_effort_canvas(
-            1248,
-            704,
+            1254,
+            720,
             "9:12 portrait",
             1.0,
             0.7,
             1.5,
         )
-        self.assertEqual(canvas, (1248, 960, 0, 128, 0, 128))
+        # width is fixed and must sit on the 32 px canvas grid; height gains
+        # bands and keeps all 720 rows on the 16 px latent grid
+        self.assertEqual(canvas, (1248, 960, 1248, 720, 0, 112, 0, 128))
+
+    def test_fixed_axis_is_cropped_to_the_canvas_grid(self):
+        canvas = h3_nodes._best_effort_canvas(
+            1264,
+            720,
+            "9:12 portrait",
+            1.0,
+            0.7,
+            1.5,
+        )
+        self.assertEqual(canvas[:4], (1248, 960, 1248, 720))
 
 
 class StreamingContractTests(unittest.TestCase):
@@ -411,7 +476,8 @@ class StreamingContractTests(unittest.TestCase):
         sampler_latents = []
 
         def sample_sliding(*args, **kwargs):
-            latent = args[3]
+            latent = args[2]
+            self.assertEqual(len(args[1]), len(args[4]))
             sampler_masks.append(latent["noise_mask"].unbind()[0].clone())
             sampler_latents.append(latent["samples"].unbind()[0].clone())
             return {"samples": latent["samples"]}
@@ -421,13 +487,13 @@ class StreamingContractTests(unittest.TestCase):
             output_path = Path(temp_dir) / "output.mp4"
             with h3_nodes.av.open(source_path, mode="w") as container:
                 stream = container.add_stream("h264", rate=30)
-                stream.width = 70
-                stream.height = 48
+                stream.width = 134
+                stream.height = 96
                 stream.pix_fmt = "yuv420p"
-                x = torch.arange(70, dtype=torch.int16).view(1, 70)
-                y = torch.arange(48, dtype=torch.int16).view(48, 1)
+                x = torch.arange(134, dtype=torch.int16).view(1, 134)
+                y = torch.arange(96, dtype=torch.int16).view(96, 1)
                 for index in range(source_count):
-                    image = torch.empty((48, 70, 3), dtype=torch.uint8)
+                    image = torch.empty((96, 134, 3), dtype=torch.uint8)
                     image[..., 0] = ((3 * x + index) % 256).to(torch.uint8)
                     image[..., 1] = ((5 * y + 2 * index) % 256).to(torch.uint8)
                     image[..., 2] = ((x + y + 3 * index) % 256).to(torch.uint8)
@@ -441,8 +507,8 @@ class StreamingContractTests(unittest.TestCase):
 
             source_video = FakeLazyVideo(
                 source_path,
-                width=70,
-                height=48,
+                width=134,
+                height=96,
                 frame_count=source_count,
                 frame_rate=30,
             )
@@ -495,6 +561,21 @@ class StreamingContractTests(unittest.TestCase):
             ):
                 video.save_to(output_path)
 
+            source_frames = h3_nodes._load_aligned_source_frames(
+                source_video,
+                0,
+                0,
+                source_count,
+                video.source_width,
+                video.source_height,
+                crop=(
+                    video.crop_left,
+                    video.crop_top,
+                    video.source_width,
+                    video.source_height,
+                ),
+            )
+
             with h3_nodes.av.open(output_path, mode="r") as container:
                 output_stream = container.streams.video[0]
                 decoded_count = sum(1 for _ in container.decode(output_stream))
@@ -503,53 +584,55 @@ class StreamingContractTests(unittest.TestCase):
                 audio_stream_count = len(container.streams.audio)
 
         self.assertFalse(source_video.components_requested)
+        # one Qwen context per window, each carrying that window's opening
+        # source frame as <Picture 1>
         self.assertEqual(clip.prompts, ["lush meadow"])
-        self.assertEqual(clip.image_batches, [None])
-        self.assertEqual((width, height, fps, length), (64, 96, 30.0, aligned_count))
-        self.assertEqual(output_size, (64, 96))
+        self.assertEqual(len(clip.image_batches), 1)
+        picture = clip.image_batches[0][0]
+        self.assertEqual(tuple(picture.shape), (1, 96, 128, 3))
+        self.assertTrue(torch.allclose(picture[0], vae.encoded[0][0]))
+        self.assertEqual((width, height, fps, length), (128, 160, 30.0, aligned_count))
+        self.assertEqual(output_size, (128, 160))
         self.assertEqual(output_fps, 30.0)
         self.assertEqual(decoded_count, aligned_count)
         self.assertEqual(audio_stream_count, 0)
         self.assertEqual(audio_vae.encoded, [])
         self.assertEqual(audio_vae.decoded, [])
         self.assertEqual(len(vae.encoded), 1)
-        self.assertEqual(vae.encoded[0].shape, (aligned_count, 32, 64, 3))
+        self.assertEqual(vae.encoded[0].shape, (aligned_count, 96, 128, 3))
         target_latent = sampler_latents[0]
-        source_y = video.model_top // 16
-        source_x = video.model_left // 16
-        source_h = vae.encoded[0].shape[1] // 16
-        source_w = vae.encoded[0].shape[2] // 16
-        self.assertTrue(
-            torch.all(
-                target_latent[
-                    :,
-                    :,
-                    :,
-                    source_y : source_y + source_h,
-                    source_x : source_x + source_w,
-                ]
-                == 1
-            )
-        )
+        source_y = video.top // 16
+        source_h = video.source_height // 16
+        self.assertTrue(torch.all(target_latent[:, :, :, source_y : source_y + source_h] == 1))
+        self.assertTrue(torch.all(target_latent[:, :, :, :source_y] == 0))
+        self.assertTrue(torch.all(target_latent[:, :, :, source_y + source_h :] == 0))
         self.assertEqual(len(vae.decoded), 1)
         self.assertEqual(len(output_values), aligned_count)
+        source_center = (
+            source_frames[
+                :source_count,
+                video.source_height // 2,
+                video.source_width // 2,
+                0,
+            ].to(torch.float32)
+            / 255.0
+        )
+        self.assertTrue(
+            torch.allclose(torch.tensor(output_values[:source_count]), source_center)
+        )
         self.assertTrue(
             torch.allclose(
-                torch.tensor(output_values),
-                torch.full((aligned_count,), 0.25),
+                torch.tensor(output_values[source_count:]),
+                torch.full((aligned_count - source_count,), 0.25),
             )
         )
         self.assertEqual(len(sampler_masks), 1)
         mask = sampler_masks[0]
         observed = h3_nodes._observed_video_tokens(source_count, mask.shape[2])
         expected_mask = torch.ones_like(mask[:, :, :observed])
-        expected_mask[
-            :,
-            :,
-            :,
-            source_y : source_y + source_h,
-            source_x : source_x + source_w,
-        ] = 0.0
+        pinned = h3_nodes._pinned_span(source_y, source_h, mask.shape[-2])
+        self.assertEqual(pinned, (3, 7))
+        expected_mask[:, :, :, pinned[0] : pinned[1]] = 0.0
         self.assertTrue(torch.equal(mask[:, :, :observed], expected_mask))
         self.assertTrue(torch.all(mask[:, :, observed:] == 1))
         self.assertIn(
@@ -567,7 +650,7 @@ class StreamingContractTests(unittest.TestCase):
         audio_masks = []
 
         def sample_sliding(*args, **kwargs):
-            latent = args[3]
+            latent = args[2]
             audio_masks.append(latent["noise_mask"].unbind()[1].clone())
             return {"samples": latent["samples"]}
 
